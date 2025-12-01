@@ -21,3 +21,4 @@ kconfig.yaml
 # Git
 .git/
 
+validate.sh
