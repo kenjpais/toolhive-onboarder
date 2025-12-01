@@ -1,0 +1,13 @@
+apiVersion: toolhive.stacklok.dev/v1alpha1
+kind: MCPServer
+metadata:
+  name: test-mcp-server
+  namespace: toolhive-test-ns
+spec:
+  image: docker.io/mcp/fetch
+  transport: stdio
+  port: 8080
+  permissionProfile:
+    type: builtin
+    name: network
+

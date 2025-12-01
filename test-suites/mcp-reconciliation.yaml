@@ -1,0 +1,36 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: mcp-reconciliation
+spec:
+  description: Test operator can reconcile MCPServer CR
+  timeouts:
+    apply: 30s
+    assert: 60s
+    cleanup: 30s
+    exec: 300s
+  steps:
+  - name: verify-operator-ready
+    description: Ensure operator is ready before testing
+    try:
+    - assert:
+        file: assert-operator-ready.yaml
+  
+  - name: deploy-mcpserver
+    description: Deploy MCPServer CR and verify reconciliation
+    try:
+    - apply:
+        file: test-mcp-server-cr.yaml
+    - assert:
+        file: assert-mcpserver-ready.yaml
+    - assert:
+        file: assert-mcpserver-deployment.yaml
+    - assert:
+        file: assert-mcpserver-service.yaml
+  
+  - name: cleanup-mcpserver
+    description: Clean up MCPServer CR
+    try:
+    - delete:
+        file: test-mcp-server-cr.yaml
+

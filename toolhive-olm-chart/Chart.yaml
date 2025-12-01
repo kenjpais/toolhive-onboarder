@@ -1,0 +1,19 @@
+apiVersion: v2
+name: toolhive-olm
+description: Helm chart for deploying ToolHive Operator via OLM (Operator Lifecycle Manager)
+type: application
+version: 0.1.0
+appVersion: "v0.3.5"
+keywords:
+  - toolhive
+  - operator
+  - olm
+  - mcp
+  - model-context-protocol
+maintainers:
+  - name: ToolHive Team
+    email: support@stacklok.com
+home: https://github.com/stacklok/toolhive
+sources:
+  - https://github.com/stacklok/toolhive
+

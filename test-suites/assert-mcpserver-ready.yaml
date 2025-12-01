@@ -1,0 +1,8 @@
+apiVersion: toolhive.stacklok.dev/v1alpha1
+kind: MCPServer
+metadata:
+  name: test-mcp-server
+  namespace: toolhive-test-ns
+status:
+  phase: "Running"
+

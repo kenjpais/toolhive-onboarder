@@ -1,0 +1,304 @@
+name: OLM Test (OKD Compatible)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      catalog_image:
+        description: 'Catalog image to use'
+        required: false
+        default: 'quay.io/kpais/toolhive-test-catalog:latest'
+
+env:
+  OPERATOR_NS: toolhive-test-ns
+  CATALOG_IMAGE: ${{ github.event.inputs.catalog_image || 'quay.io/kpais/toolhive-test-catalog:latest' }}
+  TEST_TIMEOUT: 10m
+  CLUSTER_NAME: toolhive-olm-test
+
+jobs:
+  olm-test:
+    name: OLM Operator Test (OKD Compatible)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+    
+    steps:
+      # Phase 2: CI Environment Setup
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+          cache: true
+      
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
+      
+      - name: Install Chainsaw
+        uses: kyverno/action-install-chainsaw@v0.2.13
+        with:
+          release: v0.2.12
+      
+      - name: Install OpenShift CLI (oc) for OKD compatibility
+        run: |
+          set -e
+          echo "Installing OpenShift CLI (oc) for OKD compatibility..."
+          # Install OpenShift CLI compatible with OKD
+          # Try multiple version paths for reliability
+          OC_VERSION=4.15
+          if ! curl -Lf https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-${OC_VERSION}/openshift-client-linux.tar.gz -o /tmp/oc.tar.gz 2>/dev/null; then
+            if ! curl -Lf https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OC_VERSION}/openshift-client-linux.tar.gz -o /tmp/oc.tar.gz 2>/dev/null; then
+              # Fallback to latest stable
+              curl -Lf https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz -o /tmp/oc.tar.gz
+            fi
+          fi
+          tar -xz -C /usr/local/bin -f /tmp/oc.tar.gz
+          chmod +x /usr/local/bin/oc
+          oc version --client
+          echo "OpenShift CLI (oc) installed for OKD compatibility"
+      
+      - name: Verify kubectl and oc
+        run: |
+          set -e
+          kubectl version --client
+          oc version --client
+          echo "kubectl and oc are available"
+      
+      # Phase 3: Cluster Provisioning and OLM Installation
+      # Note: Using KIND with OLM installation to simulate OKD environment
+      # KIND does not support full OKD distribution, but we simulate OKD by:
+      # - Installing OLM (which OKD includes by default)
+      # - Using OpenShift CLI (oc) for OKD-compatible operations
+      # - Using OKD standard namespaces (openshift-marketplace)
+      # In a real OKD cluster, OLM is pre-installed
+      - name: Create KIND Cluster
+        uses: helm/kind-action@v1.12.0
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          version: v0.29.0
+          cloud_provider: true
+          node_image: kindest/node:v1.32.8
+      
+      - name: Configure kubectl and oc for KIND
+        run: |
+          set -e
+          kind get kubeconfig --name ${{ env.CLUSTER_NAME }} > ${HOME}/.kube/config
+          kubectl cluster-info
+          oc cluster-info || echo "Note: oc cluster-info may not work with KIND, but oc is available for OKD-compatible operations"
+          echo "KIND cluster is ready (using OKD-compatible tooling)"
+      
+      - name: Install OLM CRDs (OKD includes OLM by default, but installing for KIND)
+        run: |
+          set -e
+          echo "Installing OLM CRDs (simulating OKD environment where OLM is pre-installed)..."
+          kubectl apply -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.28.0/crds.yaml
+          echo "OLM CRDs installed"
+      
+      - name: Install OLM (OKD includes OLM by default, but installing for KIND)
+        run: |
+          set -e
+          echo "Installing OLM components (simulating OKD environment where OLM is pre-installed)..."
+          kubectl apply -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.28.0/olm.yaml
+          echo "OLM components installed"
+      
+      - name: Wait for OLM to be ready (OKD includes OLM by default)
+        run: |
+          set -e
+          echo "Waiting for OLM operator deployment (OKD includes OLM by default)..."
+          if ! oc wait --for=condition=available --timeout=5m deployment/olm-operator -n olm; then
+            echo "ERROR: OLM operator deployment failed"
+            oc get pods -n olm
+            oc describe deployment/olm-operator -n olm
+            exit 1
+          fi
+          
+          echo "Waiting for catalog operator deployment..."
+          if ! oc wait --for=condition=available --timeout=5m deployment/catalog-operator -n olm; then
+            echo "ERROR: Catalog operator deployment failed"
+            oc get pods -n olm
+            oc describe deployment/catalog-operator -n olm
+            exit 1
+          fi
+          
+          echo "Waiting for packageserver deployment..."
+          if ! oc wait --for=condition=available --timeout=5m deployment/packageserver -n olm; then
+            echo "ERROR: Packageserver deployment failed"
+            oc get pods -n olm
+            oc describe deployment/packageserver -n olm
+            exit 1
+          fi
+          
+          echo "OLM is ready (OKD-compatible)"
+      
+      - name: Create openshift-marketplace namespace (OKD standard namespace)
+        run: |
+          set -e
+          oc create namespace openshift-marketplace --dry-run=client -o yaml | oc apply -f -
+          echo "openshift-marketplace namespace created (OKD standard namespace for CatalogSources)"
+      
+      # Phase 4: Catalog Image Preparation
+      - name: Prepare catalog image
+        run: |
+          set -e
+          echo "Using catalog image: ${{ env.CATALOG_IMAGE }}"
+          # For now, we'll use a pre-built image from registry
+          # If the image is local, it would need to be loaded into KIND:
+          # kind load docker-image ${{ env.CATALOG_IMAGE }} --name ${{ env.CLUSTER_NAME }}
+          echo "Catalog image prepared"
+      
+      # Phase 5: Declarative OLM Deployment (Helm)
+      - name: Create temp-manifests directory
+        run: |
+          set -e
+          mkdir -p temp-manifests
+          echo "temp-manifests directory created"
+      
+      - name: Render Helm chart
+        run: |
+          set -e
+          echo "Rendering Helm chart..."
+          if ! helm template toolhive-olm ./toolhive-olm-chart \
+            --set catalogSource.image=${{ env.CATALOG_IMAGE }} \
+            --set namespace.name=${{ env.OPERATOR_NS }} \
+            --set operatorGroup.targetNamespaces[0]=${{ env.OPERATOR_NS }} \
+            --set subscription.channel=stable \
+            --set subscription.source=toolhive-test-catalog \
+            --set subscription.sourceNamespace=openshift-marketplace \
+            > temp-manifests/olm-resources.yaml; then
+            echo "ERROR: Failed to render Helm chart"
+            exit 1
+          fi
+          echo "Helm chart rendered"
+          echo "--- Rendered manifests ---"
+          cat temp-manifests/olm-resources.yaml
+      
+      - name: Apply OLM resources (OKD-compatible)
+        run: |
+          set -e
+          echo "Applying OLM resources (using OKD-compatible oc command)..."
+          if ! oc apply -f temp-manifests/olm-resources.yaml; then
+            echo "ERROR: Failed to apply OLM resources"
+            cat temp-manifests/olm-resources.yaml
+            exit 1
+          fi
+          echo "OLM resources applied (OKD-compatible)"
+      
+      - name: Wait for CatalogSource to be READY (OKD standard)
+        run: |
+          set -e
+          echo "Waiting for CatalogSource to be READY (OKD openshift-marketplace namespace)..."
+          if ! oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
+            catalogsource/toolhive-test-catalog -n openshift-marketplace \
+            --timeout=${{ env.TEST_TIMEOUT }}; then
+            echo "ERROR: CatalogSource did not become READY"
+            echo "CatalogSource status:"
+            oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml
+            echo "CatalogSource pods:"
+            oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog
+            echo "CatalogSource pod logs:"
+            oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --tail=50 || true
+            exit 1
+          fi
+          echo "CatalogSource is READY (OKD-compatible)"
+      
+      - name: Wait for operator installation (OKD OLM)
+        run: |
+          set -e
+          echo "Waiting for InstallPlan (OKD OLM)..."
+          if ! timeout 300 bash -c 'until oc get installplan -n ${{ env.OPERATOR_NS }} -l "operators.coreos.com/toolhive-operator.${{ env.OPERATOR_NS }}" 2>/dev/null | grep -q Complete; do sleep 5; done'; then
+            echo "ERROR: InstallPlan did not complete"
+            echo "InstallPlan status:"
+            oc get installplan -n ${{ env.OPERATOR_NS }} -o yaml
+            echo "Subscription status:"
+            oc get subscription -n ${{ env.OPERATOR_NS }} -o yaml
+            exit 1
+          fi
+          echo "InstallPlan completed"
+          
+          echo "Waiting for CSV to be Succeeded (OKD OLM)..."
+          if ! oc wait --for=jsonpath='{.status.phase}'=Succeeded \
+            csv -n ${{ env.OPERATOR_NS }} \
+            -l "operators.coreos.com/toolhive-operator.${{ env.OPERATOR_NS }}" \
+            --timeout=${{ env.TEST_TIMEOUT }}; then
+            echo "ERROR: CSV did not reach Succeeded phase"
+            echo "CSV status:"
+            oc get csv -n ${{ env.OPERATOR_NS }} -o yaml
+            echo "CSV conditions:"
+            oc get csv -n ${{ env.OPERATOR_NS }} -o jsonpath='{.items[*].status.conditions}' || true
+            exit 1
+          fi
+          echo "CSV is Succeeded"
+          
+          echo "Waiting for operator deployment..."
+          if ! oc wait --for=condition=available \
+            deployment/toolhive-operator -n ${{ env.OPERATOR_NS }} \
+            --timeout=${{ env.TEST_TIMEOUT }}; then
+            echo "ERROR: Operator deployment did not become available"
+            echo "Deployment status:"
+            oc get deployment toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml
+            echo "Deployment pods:"
+            oc get pods -n ${{ env.OPERATOR_NS }} -l name=toolhive-operator
+            echo "Pod logs:"
+            oc logs -n ${{ env.OPERATOR_NS }} -l name=toolhive-operator --tail=50 || true
+            exit 1
+          fi
+          echo "Operator deployment is available"
+      
+      # Phase 6: Declarative Validation and Testing (Chainsaw)
+      - name: Run Chainsaw tests
+        run: |
+          set -e
+          export KUBECONFIG=${HOME}/.kube/config
+          echo "Running Chainsaw tests in namespace: ${{ env.OPERATOR_NS }}"
+          if ! chainsaw test --test-dir ./test-suites --namespace ${{ env.OPERATOR_NS }}; then
+            echo "ERROR: Chainsaw tests failed"
+            echo "Collecting diagnostic information (OKD-compatible)..."
+            oc get all -n ${{ env.OPERATOR_NS }}
+            oc get mcpserver -n ${{ env.OPERATOR_NS }} || true
+            exit 1
+          fi
+          echo "All Chainsaw tests passed"
+      
+      # Phase 7: Cleanup
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Collecting diagnostic information (OKD-compatible) ==="
+          echo "--- Cluster state ---"
+          oc get all -A | grep -E "(toolhive|olm)" || true
+          echo "--- OLM resources (OKD standard) ---"
+          oc get catalogsource,subscription,operatorgroup,csv -A || true
+          echo "--- Operator logs ---"
+          oc logs -n ${{ env.OPERATOR_NS }} -l name=toolhive-operator --tail=100 || true
+          echo "--- Events ---"
+          oc get events -n ${{ env.OPERATOR_NS }} --sort-by='.lastTimestamp' | tail -20 || true
+          echo "=== End diagnostics ==="
+      
+      - name: Cleanup OLM resources (OKD-compatible)
+        if: always()
+        run: |
+          set +e
+          echo "Cleaning up OLM resources (OKD-compatible)..."
+          oc delete subscription toolhive-operator -n ${{ env.OPERATOR_NS }} --ignore-not-found=true || true
+          oc delete operatorgroup toolhive-operator-group -n ${{ env.OPERATOR_NS }} --ignore-not-found=true || true
+          oc delete catalogsource toolhive-test-catalog -n openshift-marketplace --ignore-not-found=true || true
+          oc delete namespace ${{ env.OPERATOR_NS }} --ignore-not-found=true || true
+          echo "Cleanup completed"
+      
+      - name: Delete KIND cluster
+        if: always()
+        run: |
+          set +e
+          kind delete cluster --name ${{ env.CLUSTER_NAME }} || true
+          echo "KIND cluster deleted"
+

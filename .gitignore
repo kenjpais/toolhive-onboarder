@@ -1,0 +1,23 @@
+# Temporary files
+temp-manifests/
+*.tmp
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local test artifacts
+kconfig.yaml
+.kube/
+
+# Git
+.git/
+

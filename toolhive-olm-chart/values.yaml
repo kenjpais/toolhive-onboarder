@@ -1,0 +1,59 @@
+# Default values for toolhive-olm
+# This chart deploys ToolHive Operator via OLM (Operator Lifecycle Manager)
+
+# -- Override the name of the chart
+nameOverride: ""
+# -- Override the full name of resources
+fullnameOverride: ""
+
+# -- CatalogSource configuration
+catalogSource:
+  # -- Name of the CatalogSource resource
+  name: toolhive-test-catalog
+  # -- Namespace where CatalogSource will be created (typically openshift-marketplace)
+  namespace: openshift-marketplace
+  # -- Display name for the catalog
+  displayName: ToolHive Test Catalog
+  # -- Container image for the catalog index
+  image: quay.io/kpais/toolhive-test-catalog:latest
+  # -- Publisher name
+  publisher: ToolHive Test
+  # -- Update strategy for the catalog
+  updateStrategy:
+    registryPoll:
+      # -- Interval for polling the registry for updates
+      interval: 10m
+
+# -- OperatorGroup configuration
+operatorGroup:
+  # -- Name of the OperatorGroup resource
+  name: toolhive-operator-group
+  # -- Target namespaces for the operator (empty list means all namespaces)
+  targetNamespaces:
+    - toolhive-test-ns
+
+# -- Subscription configuration
+subscription:
+  # -- Name of the Subscription resource
+  name: toolhive-operator
+  # -- Channel to subscribe to (e.g., stable, alpha, beta)
+  channel: stable
+  # -- Name of the CatalogSource to subscribe from
+  source: toolhive-test-catalog
+  # -- Namespace of the CatalogSource
+  sourceNamespace: openshift-marketplace
+  # -- InstallPlan approval mode: Automatic or Manual
+  installPlanApproval: Automatic
+  # -- Optional: Starting CSV version (for upgrades)
+  startingCSV: ""
+
+# -- Namespace configuration
+namespace:
+  # -- Name of the namespace to create
+  name: toolhive-test-ns
+  # -- Whether to create the namespace
+  create: true
+  # -- Additional labels for the namespace
+  labels: {}
+  # -- Additional annotations for the namespace
+  annotations: {}

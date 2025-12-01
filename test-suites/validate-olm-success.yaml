@@ -1,0 +1,43 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: validate-olm-success
+spec:
+  description: Validate OLM successfully installed the ToolHive Operator
+  timeouts:
+    apply: 30s
+    assert: 60s
+    cleanup: 30s
+    exec: 300s
+  steps:
+  - name: verify-catalogsource
+    description: Verify CatalogSource is READY
+    try:
+    - assert:
+        file: assert-catalogsource-ready.yaml
+  
+  - name: verify-crds
+    description: Verify CRDs are installed
+    try:
+    - assert:
+        file: assert-crds-installed.yaml
+  
+  - name: verify-csv
+    description: Verify ClusterServiceVersion is Succeeded
+    try:
+    - script:
+        content: |
+          CSV_PHASE=$(oc get csv -n toolhive-test-ns -l "operators.coreos.com/toolhive-operator.toolhive-test-ns" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
+          if [ "$CSV_PHASE" != "Succeeded" ]; then
+            echo "CSV phase is: $CSV_PHASE (expected: Succeeded)"
+            oc get csv -n toolhive-test-ns -o yaml
+            exit 1
+          fi
+          echo "CSV is Succeeded"
+  
+  - name: verify-operator-deployment
+    description: Verify operator deployment is ready
+    try:
+    - assert:
+        file: assert-operator-ready.yaml
+
