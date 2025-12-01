@@ -241,34 +241,61 @@ jobs:
           echo "Checking catalog pod status..."
           oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true
           
-          # Check if pod is crashing and get diagnostics
-          POD_STATUS=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
-          if [ "$POD_STATUS" = "CrashLoopBackOff" ] || [ "$POD_STATUS" = "Error" ]; then
-            echo "ERROR: Catalog pod is in $POD_STATUS state - this usually means the catalog image is invalid or doesn't exist"
-            echo "=== Catalog pod describe ==="
-            oc describe pod -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true
-            echo ""
-            echo "=== CatalogSource pod logs (all containers) ==="
-            oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --all-containers=true --tail=100 || true
-            echo ""
-            echo "=== Previous container logs (if any) ==="
-            oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --previous --tail=100 || true
-            echo ""
-            echo "=== Events in openshift-marketplace ==="
-            oc get events -n openshift-marketplace --sort-by='.lastTimestamp' | tail -30 || true
-            echo ""
-            echo "=== Root Cause Analysis ==="
-            echo "The catalog image '${{ env.CATALOG_IMAGE }}' is likely:"
-            echo "  1. Missing or doesn't exist in the registry"
-            echo "  2. Not a valid OLM catalog index image"
-            echo "  3. Has authentication/access issues"
-            echo ""
-            echo "To fix this:"
-            echo "  1. Verify the image exists: docker pull ${{ env.CATALOG_IMAGE }}"
-            echo "  2. Ensure it's a valid catalog index built with 'opm index'"
-            echo "  3. Update CATALOG_IMAGE environment variable if using a different image"
-            exit 1
-          fi
+          # Wait a bit for pod to stabilize and check status
+          echo "Waiting for pod to stabilize..."
+          sleep 10
+          
+          # Check pod status and wait states in a loop
+          MAX_CHECKS=12
+          CHECK_COUNT=0
+          while [ $CHECK_COUNT -lt $MAX_CHECKS ]; do
+            POD_STATUS=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
+            CONTAINER_STATUS=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
+            
+            echo "Pod status: $POD_STATUS, Container waiting reason: $CONTAINER_STATUS"
+            
+            # Check for failure states
+            if [ "$POD_STATUS" = "CrashLoopBackOff" ] || [ "$POD_STATUS" = "Error" ] || [ "$CONTAINER_STATUS" = "ImagePullBackOff" ] || [ "$CONTAINER_STATUS" = "ErrImagePull" ]; then
+              echo "ERROR: Catalog pod is in failure state - Status: $POD_STATUS, Container: $CONTAINER_STATUS"
+              echo "This usually means the catalog image is invalid or doesn't exist"
+              echo ""
+              echo "=== Catalog pod describe ==="
+              oc describe pod -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true
+              echo ""
+              echo "=== CatalogSource pod logs (all containers) ==="
+              oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --all-containers=true --tail=100 || true
+              echo ""
+              echo "=== Previous container logs (if any) ==="
+              oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --previous --tail=100 || true
+              echo ""
+              echo "=== Events in openshift-marketplace ==="
+              oc get events -n openshift-marketplace --sort-by='.lastTimestamp' | tail -30 || true
+              echo ""
+              echo "=== Root Cause Analysis ==="
+              echo "The catalog image '${{ env.CATALOG_IMAGE }}' is likely:"
+              echo "  1. Missing or doesn't exist in the registry"
+              echo "  2. Not a valid OLM catalog index image"
+              echo "  3. Has authentication/access issues"
+              echo ""
+              echo "To fix this:"
+              echo "  1. Verify the image exists: docker pull ${{ env.CATALOG_IMAGE }}"
+              echo "  2. Ensure it's a valid catalog index built with 'opm index'"
+              echo "  3. Update CATALOG_IMAGE environment variable if using a different image"
+              exit 1
+            fi
+            
+            # If pod is running, break out of the loop
+            if [ "$POD_STATUS" = "Running" ]; then
+              echo "Pod is running, proceeding to wait for READY state"
+              break
+            fi
+            
+            CHECK_COUNT=$((CHECK_COUNT + 1))
+            if [ $CHECK_COUNT -lt $MAX_CHECKS ]; then
+              echo "Pod not in final state yet, waiting 5 seconds... (check $CHECK_COUNT/$MAX_CHECKS)"
+              sleep 5
+            fi
+          done
           
           echo "Waiting for CatalogSource to become READY..."
           if ! oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
