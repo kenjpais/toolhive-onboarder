@@ -155,9 +155,10 @@ jobs:
         run: |
           set -e
           echo "Using catalog image: ${{ env.CATALOG_IMAGE }}"
-          # For now, we'll use a pre-built image from registry
-          # If the image is local, it would need to be loaded into KIND:
-          # kind load docker-image ${{ env.CATALOG_IMAGE }} --name ${{ env.CLUSTER_NAME }}
+          # Verify image exists (optional check - may fail if image doesn't exist, but that's OK)
+          echo "Note: Catalog image will be pulled by the cluster when CatalogSource is created"
+          echo "If using a local image, it would need to be loaded into KIND:"
+          echo "  kind load docker-image ${{ env.CATALOG_IMAGE }} --name ${{ env.CLUSTER_NAME }}"
           echo "Catalog image prepared"
       
       # Phase 5: Declarative OLM Deployment (Helm)
@@ -201,16 +202,51 @@ jobs:
         run: |
           set -e
           echo "Waiting for CatalogSource to be READY (OKD openshift-marketplace namespace)..."
+          echo "First, checking if catalog-operator is ready..."
+          oc wait --for=condition=available --timeout=2m deployment/catalog-operator -n olm || echo "Warning: catalog-operator might not be fully ready"
+          
+          echo "Checking CatalogSource status..."
+          oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml || echo "CatalogSource not found yet"
+          
+          echo "Waiting for CatalogSource pod to be created..."
+          timeout 120 bash -c 'until oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog 2>/dev/null | grep -q toolhive-test-catalog; do echo "Waiting for catalog pod..."; sleep 5; done' || echo "Catalog pod not created yet"
+          
+          echo "Checking catalog pod status..."
+          oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true
+          
+          # Check if pod is crashing and get diagnostics
+          POD_STATUS=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
+          if [ "$POD_STATUS" = "CrashLoopBackOff" ] || [ "$POD_STATUS" = "Error" ]; then
+            echo "WARNING: Catalog pod is in $POD_STATUS state"
+            echo "=== Catalog pod describe ==="
+            oc describe pod -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true
+            echo "=== CatalogSource pod logs (all containers) ==="
+            oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --all-containers=true --tail=100 || true
+            echo "=== Previous container logs (if any) ==="
+            oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --previous --tail=100 || true
+            echo "=== Events in openshift-marketplace ==="
+            oc get events -n openshift-marketplace --sort-by='.lastTimestamp' | tail -30 || true
+          fi
+          
+          echo "Waiting for CatalogSource to become READY..."
           if ! oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
             catalogsource/toolhive-test-catalog -n openshift-marketplace \
             --timeout=${{ env.TEST_TIMEOUT }}; then
             echo "ERROR: CatalogSource did not become READY"
-            echo "CatalogSource status:"
+            echo "=== CatalogSource status ==="
             oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml
-            echo "CatalogSource pods:"
+            echo "=== CatalogSource pods ==="
             oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog
-            echo "CatalogSource pod logs:"
-            oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --tail=50 || true
+            echo "=== Catalog pod describe ==="
+            oc describe pod -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true
+            echo "=== CatalogSource pod logs (all containers) ==="
+            oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --all-containers=true --tail=100 || true
+            echo "=== Previous container logs (if any) ==="
+            oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --previous --tail=100 || true
+            echo "=== Catalog-operator logs ==="
+            oc logs -n olm -l app=catalog-operator --tail=50 || true
+            echo "=== Events in openshift-marketplace ==="
+            oc get events -n openshift-marketplace --sort-by='.lastTimestamp' | tail -30 || true
             exit 1
           fi
           echo "CatalogSource is READY (OKD-compatible)"
