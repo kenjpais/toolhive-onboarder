@@ -37,7 +37,6 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: '1.22'
-          cache: true
       
       - name: Set up Helm
         uses: azure/setup-helm@v4
@@ -86,13 +85,14 @@ jobs:
         with:
           cluster_name: ${{ env.CLUSTER_NAME }}
           version: v0.29.0
-          cloud_provider: true
           node_image: kindest/node:v1.32.8
       
       - name: Configure kubectl and oc for KIND
         run: |
           set -e
           kind get kubeconfig --name ${{ env.CLUSTER_NAME }} > ${HOME}/.kube/config
+          # Wait for cluster to be ready
+          kubectl wait --for=condition=Ready node --all --timeout=120s
           kubectl cluster-info
           oc cluster-info || echo "Note: oc cluster-info may not work with KIND, but oc is available for OKD-compatible operations"
           echo "KIND cluster is ready (using OKD-compatible tooling)"
@@ -101,8 +101,20 @@ jobs:
         run: |
           set -e
           echo "Installing OLM CRDs (simulating OKD environment where OLM is pre-installed)..."
-          kubectl apply -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.28.0/crds.yaml
-          echo "OLM CRDs installed"
+          # Install OLM CRDs with retry logic
+          for i in {1..3}; do
+            if kubectl apply -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.28.0/crds.yaml; then
+              echo "OLM CRDs installed successfully"
+              break
+            else
+              echo "Attempt $i failed, retrying in 5 seconds..."
+              sleep 5
+              if [ $i -eq 3 ]; then
+                echo "ERROR: Failed to install OLM CRDs after 3 attempts"
+                exit 1
+              fi
+            fi
+          done
       
       - name: Install OLM (OKD includes OLM by default, but installing for KIND)
         run: |
