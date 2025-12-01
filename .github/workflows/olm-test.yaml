@@ -155,11 +155,38 @@ jobs:
         run: |
           set -e
           echo "Using catalog image: ${{ env.CATALOG_IMAGE }}"
-          # Verify image exists (optional check - may fail if image doesn't exist, but that's OK)
           echo "Note: Catalog image will be pulled by the cluster when CatalogSource is created"
           echo "If using a local image, it would need to be loaded into KIND:"
           echo "  kind load docker-image ${{ env.CATALOG_IMAGE }} --name ${{ env.CLUSTER_NAME }}"
           echo "Catalog image prepared"
+      
+      - name: Verify catalog image accessibility
+        continue-on-error: true
+        run: |
+          set +e
+          echo "Verifying catalog image accessibility..."
+          echo "Attempting to pull catalog image: ${{ env.CATALOG_IMAGE }}"
+          # Try to pull the image to verify it exists and is accessible
+          # This will help catch image issues early before creating the CatalogSource
+          # We use continue-on-error so the workflow continues even if pull fails
+          # (some images may require authentication or may not exist yet)
+          if docker pull ${{ env.CATALOG_IMAGE }} 2>&1 | tee /tmp/image-pull.log; then
+            echo "Catalog image pulled successfully"
+            # Load into KIND to speed up pod startup
+            echo "Loading catalog image into KIND cluster..."
+            kind load docker-image ${{ env.CATALOG_IMAGE }} --name ${{ env.CLUSTER_NAME }} || echo "Warning: Failed to load image into KIND"
+          else
+            echo "WARNING: Failed to pull catalog image ${{ env.CATALOG_IMAGE }}"
+            echo "Image pull log:"
+            cat /tmp/image-pull.log || true
+            echo ""
+            echo "This may cause the CatalogSource pod to fail."
+            echo "If the image doesn't exist, you need to:"
+            echo "  1. Build and push the catalog image to ${{ env.CATALOG_IMAGE }}"
+            echo "  2. Or update CATALOG_IMAGE to point to an existing catalog image"
+            echo ""
+            echo "The workflow will continue, but will fail later if the image is invalid."
+          fi
       
       # Phase 5: Declarative OLM Deployment (Helm)
       - name: Create temp-manifests directory
@@ -217,15 +244,30 @@ jobs:
           # Check if pod is crashing and get diagnostics
           POD_STATUS=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
           if [ "$POD_STATUS" = "CrashLoopBackOff" ] || [ "$POD_STATUS" = "Error" ]; then
-            echo "WARNING: Catalog pod is in $POD_STATUS state"
+            echo "ERROR: Catalog pod is in $POD_STATUS state - this usually means the catalog image is invalid or doesn't exist"
             echo "=== Catalog pod describe ==="
             oc describe pod -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true
+            echo ""
             echo "=== CatalogSource pod logs (all containers) ==="
             oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --all-containers=true --tail=100 || true
+            echo ""
             echo "=== Previous container logs (if any) ==="
             oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --previous --tail=100 || true
+            echo ""
             echo "=== Events in openshift-marketplace ==="
             oc get events -n openshift-marketplace --sort-by='.lastTimestamp' | tail -30 || true
+            echo ""
+            echo "=== Root Cause Analysis ==="
+            echo "The catalog image '${{ env.CATALOG_IMAGE }}' is likely:"
+            echo "  1. Missing or doesn't exist in the registry"
+            echo "  2. Not a valid OLM catalog index image"
+            echo "  3. Has authentication/access issues"
+            echo ""
+            echo "To fix this:"
+            echo "  1. Verify the image exists: docker pull ${{ env.CATALOG_IMAGE }}"
+            echo "  2. Ensure it's a valid catalog index built with 'opm index'"
+            echo "  3. Update CATALOG_IMAGE environment variable if using a different image"
+            exit 1
           fi
           
           echo "Waiting for CatalogSource to become READY..."
