@@ -101,20 +101,12 @@ jobs:
         run: |
           set -e
           echo "Installing OLM CRDs (simulating OKD environment where OLM is pre-installed)..."
-          # Install OLM CRDs with retry logic
-          for i in {1..3}; do
-            if kubectl apply -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.28.0/crds.yaml; then
-              echo "OLM CRDs installed successfully"
-              break
-            else
-              echo "Attempt $i failed, retrying in 5 seconds..."
-              sleep 5
-              if [ $i -eq 3 ]; then
-                echo "ERROR: Failed to install OLM CRDs after 3 attempts"
-                exit 1
-              fi
-            fi
-          done
+          # Download CRDs file first
+          curl -L https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.28.0/crds.yaml -o /tmp/olm-crds.yaml
+          # Use server-side apply to handle large CRDs with large annotations
+          # This bypasses the client-side annotation size limit
+          kubectl apply --server-side -f /tmp/olm-crds.yaml || kubectl apply --server-side --force-conflicts -f /tmp/olm-crds.yaml
+          echo "OLM CRDs installed successfully"
       
       - name: Install OLM (OKD includes OLM by default, but installing for KIND)
         run: |
