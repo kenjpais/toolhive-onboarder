@@ -250,13 +250,26 @@ jobs:
           CHECK_COUNT=0
           while [ $CHECK_COUNT -lt $MAX_CHECKS ]; do
             POD_STATUS=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
-            CONTAINER_STATUS=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
+            # Check container waiting reason (for ImagePullBackOff, ErrImagePull)
+            CONTAINER_WAITING=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
+            # Check container last state reason (for CrashLoopBackOff)
+            CONTAINER_LAST_STATE=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].status.containerStatuses[0].lastState.terminated.reason}' 2>/dev/null || echo "")
             
-            echo "Pod status: $POD_STATUS, Container waiting reason: $CONTAINER_STATUS"
+            echo "Pod status: $POD_STATUS, Container waiting: $CONTAINER_WAITING, Container last state: $CONTAINER_LAST_STATE"
             
             # Check for failure states
-            if [ "$POD_STATUS" = "CrashLoopBackOff" ] || [ "$POD_STATUS" = "Error" ] || [ "$CONTAINER_STATUS" = "ImagePullBackOff" ] || [ "$CONTAINER_STATUS" = "ErrImagePull" ]; then
-              echo "ERROR: Catalog pod is in failure state - Status: $POD_STATUS, Container: $CONTAINER_STATUS"
+            # ImagePullBackOff and ErrImagePull appear when pod phase is Pending
+            # CrashLoopBackOff appears as the pod phase itself
+            if [ "$POD_STATUS" = "CrashLoopBackOff" ] || \
+               [ "$POD_STATUS" = "Error" ] || \
+               [ "$CONTAINER_WAITING" = "ImagePullBackOff" ] || \
+               [ "$CONTAINER_WAITING" = "ErrImagePull" ] || \
+               [ "$CONTAINER_LAST_STATE" = "Error" ]; then
+              echo "ERROR: Catalog pod is in failure state"
+              echo "  Pod Phase: $POD_STATUS"
+              echo "  Container Waiting Reason: $CONTAINER_WAITING"
+              echo "  Container Last State: $CONTAINER_LAST_STATE"
+              echo ""
               echo "This usually means the catalog image is invalid or doesn't exist"
               echo ""
               echo "=== Catalog pod describe ==="
@@ -272,15 +285,35 @@ jobs:
               oc get events -n openshift-marketplace --sort-by='.lastTimestamp' | tail -30 || true
               echo ""
               echo "=== Root Cause Analysis ==="
-              echo "The catalog image '${{ env.CATALOG_IMAGE }}' is likely:"
-              echo "  1. Missing or doesn't exist in the registry"
-              echo "  2. Not a valid OLM catalog index image"
-              echo "  3. Has authentication/access issues"
-              echo ""
-              echo "To fix this:"
-              echo "  1. Verify the image exists: docker pull ${{ env.CATALOG_IMAGE }}"
-              echo "  2. Ensure it's a valid catalog index built with 'opm index'"
-              echo "  3. Update CATALOG_IMAGE environment variable if using a different image"
+              # Check for specific error messages
+              POD_DESCRIBE=$(oc describe pod -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog 2>/dev/null || echo "")
+              if echo "$POD_DESCRIBE" | grep -q "exec format error"; then
+                echo "ERROR: Architecture mismatch detected!"
+                echo ""
+                echo "The catalog image '${{ env.CATALOG_IMAGE }}' was built for a different CPU architecture."
+                echo "The error 'exec /bin/opm: exec format error' indicates the image is built for ARM64"
+                echo "but the KIND cluster (and GitHub Actions runners) use AMD64/x86_64."
+                echo ""
+                echo "To fix this, rebuild the catalog image for linux/amd64:"
+                echo "  1. Build with platform specification:"
+                echo "     docker buildx build --platform linux/amd64 -t ${{ env.CATALOG_IMAGE }} ."
+                echo "  2. Or use opm with platform:"
+                echo "     docker buildx build --platform linux/amd64 --load -t ${{ env.CATALOG_IMAGE }} ."
+                echo "  3. Or build multi-arch image:"
+                echo "     docker buildx build --platform linux/amd64,linux/arm64 -t ${{ env.CATALOG_IMAGE }} ."
+                echo "  4. Push the image:"
+                echo "     docker push ${{ env.CATALOG_IMAGE }}"
+              else
+                echo "The catalog image '${{ env.CATALOG_IMAGE }}' is likely:"
+                echo "  1. Missing or doesn't exist in the registry"
+                echo "  2. Not a valid OLM catalog index image"
+                echo "  3. Has authentication/access issues"
+                echo ""
+                echo "To fix this:"
+                echo "  1. Verify the image exists: docker pull ${{ env.CATALOG_IMAGE }}"
+                echo "  2. Ensure it's a valid catalog index built with 'opm index'"
+                echo "  3. Update CATALOG_IMAGE environment variable if using a different image"
+              fi
               exit 1
             fi
             
@@ -307,7 +340,8 @@ jobs:
             echo "=== CatalogSource pods ==="
             oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog
             echo "=== Catalog pod describe ==="
-            oc describe pod -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true
+            POD_DESCRIBE=$(oc describe pod -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog || true)
+            echo "$POD_DESCRIBE"
             echo "=== CatalogSource pod logs (all containers) ==="
             oc logs -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog --all-containers=true --tail=100 || true
             echo "=== Previous container logs (if any) ==="
@@ -316,6 +350,35 @@ jobs:
             oc logs -n olm -l app=catalog-operator --tail=50 || true
             echo "=== Events in openshift-marketplace ==="
             oc get events -n openshift-marketplace --sort-by='.lastTimestamp' | tail -30 || true
+            echo ""
+            echo "=== Root Cause Analysis ==="
+            # Check for architecture mismatch error
+            if echo "$POD_DESCRIBE" | grep -q "exec format error"; then
+              echo "ERROR: Architecture mismatch detected!"
+              echo ""
+              echo "The catalog image '${{ env.CATALOG_IMAGE }}' was built for a different CPU architecture."
+              echo "The error 'exec /bin/opm: exec format error' indicates the image is built for ARM64"
+              echo "but the KIND cluster (and GitHub Actions runners) use AMD64/x86_64."
+              echo ""
+              echo "To fix this, rebuild the catalog image for linux/amd64:"
+              echo "  1. If using docker buildx:"
+              echo "     docker buildx build --platform linux/amd64 -t ${{ env.CATALOG_IMAGE }} ."
+              echo "     docker push ${{ env.CATALOG_IMAGE }}"
+              echo "  2. If using opm index:"
+              echo "     opm index add --bundles <bundles> --tag ${{ env.CATALOG_IMAGE }}"
+              echo "     docker buildx build --platform linux/amd64 --load -t ${{ env.CATALOG_IMAGE }} ."
+              echo "     docker push ${{ env.CATALOG_IMAGE }}"
+              echo "  3. Or build multi-arch image:"
+              echo "     docker buildx build --platform linux/amd64,linux/arm64 -t ${{ env.CATALOG_IMAGE }} ."
+              echo "     docker push ${{ env.CATALOG_IMAGE }}"
+            else
+              echo "The catalog image '${{ env.CATALOG_IMAGE }}' may be:"
+              echo "  1. Invalid or corrupted"
+              echo "  2. Not a valid OLM catalog index image"
+              echo "  3. Has other runtime issues"
+              echo ""
+              echo "Check the pod logs and describe output above for details."
+            fi
             exit 1
           fi
           echo "CatalogSource is READY (OKD-compatible)"
