@@ -29,7 +29,9 @@ env:
   CATALOG_IMAGE: ${{ github.event.inputs.catalog_image || 'quay.io/kpais/toolhive-test-catalog:latest' }}
   CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
   REGISTRY: quay.io
-  REGISTRY_USER: kpais
+  # Use QUAY_IO_USERNAME secret if set (for robot accounts like kpais+buildcatalogbot)
+  # Otherwise defaults to kpais
+  REGISTRY_USER: ${{ secrets.QUAY_IO_USERNAME || 'kpais' }}
 
 jobs:
   build-catalog:
