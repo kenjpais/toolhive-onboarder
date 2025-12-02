@@ -1,0 +1,169 @@
+name: Build Catalog Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      operator_bundle_image:
+        description: 'Operator bundle image to include in catalog'
+        required: false
+        default: 'quay.io/kpais/toolhive-operator-bundle:latest'
+      catalog_image:
+        description: 'Catalog image to build and push'
+        required: false
+        default: 'quay.io/kpais/toolhive-test-catalog:latest'
+      channel:
+        description: 'Channel name for the operator'
+        required: false
+        default: 'stable'
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/build-catalog.yaml'
+      - 'catalog/**'
+  schedule:
+    # Run daily to rebuild catalog with latest bundles
+    - cron: '0 0 * * *'
+
+env:
+  OPERATOR_BUNDLE_IMAGE: ${{ github.event.inputs.operator_bundle_image || 'quay.io/kpais/toolhive-operator-bundle:latest' }}
+  CATALOG_IMAGE: ${{ github.event.inputs.catalog_image || 'quay.io/kpais/toolhive-test-catalog:latest' }}
+  CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
+  REGISTRY: quay.io
+  REGISTRY_USER: kpais
+
+jobs:
+  build-catalog:
+    name: Build Catalog Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64
+      
+      - name: Log in to Quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.QUAY_IO_TOKEN }}
+      
+      - name: Install opm CLI
+        run: |
+          set -e
+          echo "Installing opm CLI..."
+          OPM_VERSION=v1.35.0
+          curl -L https://github.com/operator-framework/operator-registry/releases/download/${OPM_VERSION}/linux-amd64-opm -o /usr/local/bin/opm
+          chmod +x /usr/local/bin/opm
+          opm version
+          echo "opm CLI installed successfully"
+      
+      - name: Verify operator bundle image exists
+        run: |
+          set -e
+          echo "Verifying operator bundle image: ${{ env.OPERATOR_BUNDLE_IMAGE }}"
+          # Check if image exists and is accessible
+          docker pull ${{ env.OPERATOR_BUNDLE_IMAGE }} || {
+            echo "ERROR: Failed to pull operator bundle image: ${{ env.OPERATOR_BUNDLE_IMAGE }}"
+            echo "Please ensure the bundle image exists and is accessible"
+            exit 1
+          }
+          echo "Operator bundle image verified"
+          
+          # Verify architecture
+          echo "Checking bundle image architecture..."
+          ARCH=$(docker inspect ${{ env.OPERATOR_BUNDLE_IMAGE }} --format '{{.Architecture}}' || echo "unknown")
+          echo "Bundle image architecture: $ARCH"
+          if [ "$ARCH" != "amd64" ] && [ "$ARCH" != "x86_64" ]; then
+            echo "WARNING: Bundle image architecture is $ARCH, expected amd64/x86_64"
+          fi
+      
+      - name: Generate catalog index
+        run: |
+          set -e
+          echo "Generating catalog index..."
+          
+          # Generate the catalog index
+          # opm index add --generate creates catalog-index.Dockerfile and database/index.db
+          opm index add \
+            --bundles ${{ env.OPERATOR_BUNDLE_IMAGE }} \
+            --tag ${{ env.CATALOG_IMAGE }} \
+            --binary-image quay.io/operator-framework/opm:v1.35.0 \
+            --mode semver \
+            --generate
+          
+          echo "Catalog index generated"
+          echo "Generated files:"
+          ls -la catalog-index.Dockerfile 2>/dev/null || ls -la *.Dockerfile 2>/dev/null || find . -name "*.Dockerfile" -type f
+          ls -la database/ 2>/dev/null || echo "Database directory not found"
+      
+      - name: Build and push catalog image
+        run: |
+          set -e
+          echo "Building catalog image for linux/amd64 architecture..."
+          
+          # Find the generated Dockerfile
+          DOCKERFILE="catalog-index.Dockerfile"
+          if [ ! -f "$DOCKERFILE" ]; then
+            DOCKERFILE=$(find . -name "*.Dockerfile" -type f | head -1)
+            if [ -z "$DOCKERFILE" ]; then
+              echo "ERROR: Could not find generated Dockerfile"
+              exit 1
+            fi
+          fi
+          
+          echo "Using Dockerfile: $DOCKERFILE"
+          
+          # Build the catalog image with explicit platform
+          docker buildx build \
+            --platform linux/amd64 \
+            --tag ${{ env.CATALOG_IMAGE }} \
+            --file "$DOCKERFILE" \
+            --push \
+            .
+          
+          echo "Catalog image built and pushed successfully"
+      
+      - name: Verify catalog image architecture
+        run: |
+          set -e
+          echo "Verifying catalog image architecture..."
+          
+          # Pull the image to verify
+          docker pull ${{ env.CATALOG_IMAGE }}
+          
+          # Check architecture
+          ARCH=$(docker inspect ${{ env.CATALOG_IMAGE }} --format '{{.Architecture}}' || echo "unknown")
+          echo "Catalog image architecture: $ARCH"
+          
+          if [ "$ARCH" != "amd64" ] && [ "$ARCH" != "x86_64" ]; then
+            echo "ERROR: Catalog image architecture is $ARCH, expected amd64/x86_64"
+            exit 1
+          fi
+          
+          # Verify opm binary in the image
+          echo "Verifying opm binary in catalog image..."
+          docker run --rm --entrypoint /bin/sh ${{ env.CATALOG_IMAGE }} -c "file /bin/opm || file /usr/bin/opm || find / -name opm -type f 2>/dev/null | head -1 | xargs file" || {
+            echo "WARNING: Could not verify opm binary, but image was built successfully"
+          }
+          
+          echo "Catalog image verification complete"
+      
+      - name: Display catalog image info
+        run: |
+          set -e
+          echo "=== Catalog Image Information ==="
+          echo "Image: ${{ env.CATALOG_IMAGE }}"
+          echo "Architecture: $(docker inspect ${{ env.CATALOG_IMAGE }} --format '{{.Architecture}}')"
+          echo "Size: $(docker inspect ${{ env.CATALOG_IMAGE }} --format '{{.Size}}' | numfmt --to=iec-i --suffix=B)"
+          echo "Created: $(docker inspect ${{ env.CATALOG_IMAGE }} --format '{{.Created}}')"
+          echo "================================"
+
