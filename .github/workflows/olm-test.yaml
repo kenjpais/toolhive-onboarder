@@ -487,28 +487,55 @@ jobs:
           echo "=== Subscription status ==="
           oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml || true
       
-      - name: Wait for operator installation (OKD OLM)
+      - name: Wait for Subscription to resolve operator
         run: |
           set -e
-          echo "Waiting for InstallPlan (OKD OLM)..."
+          echo "Waiting for Subscription to resolve the operator from catalog..."
+          echo "This ensures the catalog-operator's resolver has recognized the catalog"
           
-          # First, wait for InstallPlan to be created
-          echo "Waiting for InstallPlan to be created..."
-          MAX_WAIT=120
+          MAX_WAIT=180  # Wait up to 3 minutes for resolution
           ELAPSED=0
+          RESOLVED=false
+          
           while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Check Subscription conditions
+            UNHEALTHY=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath='{.status.conditions[?(@.type=="CatalogSourcesUnhealthy")].status}' 2>/dev/null || echo "")
+            RESOLUTION_FAILED=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath='{.status.conditions[?(@.type=="ResolutionFailed")].status}' 2>/dev/null || echo "")
+            
+            # Check if InstallPlan exists (indicates successful resolution)
             INSTALLPLAN_COUNT=$(oc get installplan -n ${{ env.OPERATOR_NS }} -l "operators.coreos.com/toolhive-operator.${{ env.OPERATOR_NS }}" --no-headers 2>/dev/null | wc -l || echo "0")
+            
             if [ "$INSTALLPLAN_COUNT" -gt 0 ]; then
-              echo "InstallPlan found"
+              echo "✓ InstallPlan created - operator resolved successfully!"
+              RESOLVED=true
               break
             fi
-            echo "Waiting for InstallPlan to be created... (${ELAPSED}s/${MAX_WAIT}s)"
+            
+            # If catalog is still reported as unhealthy, wait longer
+            if [ "$UNHEALTHY" = "True" ] || [ "$RESOLUTION_FAILED" = "True" ]; then
+              echo "Subscription still cannot resolve (${ELAPSED}s/${MAX_WAIT}s)..."
+              echo "  CatalogSourcesUnhealthy: $UNHEALTHY"
+              echo "  ResolutionFailed: $RESOLUTION_FAILED"
+              
+              # Show current Subscription status for debugging
+              if [ $((ELAPSED % 30)) -eq 0 ]; then
+                echo "  Current Subscription conditions:"
+                oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath='{.status.conditions[*].type}' 2>/dev/null | tr ' ' '\n' | while read type; do
+                  status=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath="{.status.conditions[?(@.type==\"$type\")].status}" 2>/dev/null || echo "")
+                  reason=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath="{.status.conditions[?(@.type==\"$type\")].reason}" 2>/dev/null || echo "")
+                  echo "    $type: $status ($reason)"
+                done || true
+              fi
+            else
+              echo "Subscription is processing... (${ELAPSED}s/${MAX_WAIT}s)"
+            fi
+            
             sleep 5
             ELAPSED=$((ELAPSED + 5))
           done
           
-          if [ "$INSTALLPLAN_COUNT" -eq 0 ]; then
-            echo "ERROR: InstallPlan was not created"
+          if [ "$RESOLVED" != "true" ]; then
+            echo "ERROR: Subscription failed to resolve operator after ${MAX_WAIT} seconds"
             echo "=== Subscription status ==="
             oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml
             echo "=== Subscription conditions ==="
@@ -516,15 +543,29 @@ jobs:
             echo ""
             echo "=== CatalogSource status ==="
             oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml
-            echo "=== Available operators in catalog ==="
-            # Try to see what operators are available
-            CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-            if [ -n "$CATALOG_POD" ]; then
-              echo "Catalog pod: $CATALOG_POD"
-              oc exec -n openshift-marketplace $CATALOG_POD -- ls -la /configs 2>/dev/null || true
-            fi
+            echo "=== Catalog-operator logs (last 50 lines) ==="
+            oc logs -n olm -l app=catalog-operator --tail=50 || true
             exit 1
           fi
+          
+          echo "Subscription has successfully resolved the operator"
+      
+      - name: Wait for operator installation (OKD OLM)
+        run: |
+          set -e
+          echo "Waiting for InstallPlan to complete (OKD OLM)..."
+          echo "Note: InstallPlan should already exist from previous step"
+          
+          # Verify InstallPlan exists (should have been created in previous step)
+          INSTALLPLAN_COUNT=$(oc get installplan -n ${{ env.OPERATOR_NS }} -l "operators.coreos.com/toolhive-operator.${{ env.OPERATOR_NS }}" --no-headers 2>/dev/null | wc -l || echo "0")
+          if [ "$INSTALLPLAN_COUNT" -eq 0 ]; then
+            echo "ERROR: InstallPlan was not created (this should have been caught in previous step)"
+            echo "=== Subscription status ==="
+            oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml
+            exit 1
+          fi
+          
+          echo "InstallPlan found, waiting for it to complete..."
           
           # Now wait for InstallPlan to complete
           if ! timeout 300 bash -c 'until oc get installplan -n ${{ env.OPERATOR_NS }} -l "operators.coreos.com/toolhive-operator.${{ env.OPERATOR_NS }}" 2>/dev/null | grep -q Complete; do sleep 5; done'; then
