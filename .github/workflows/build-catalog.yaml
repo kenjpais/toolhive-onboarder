@@ -6,7 +6,7 @@ on:
       operator_bundle_image:
         description: 'Operator bundle image to include in catalog'
         required: false
-        default: 'quay.io/kpais/toolhive-operator-bundle:latest'
+        default: 'quay.io/okderators/toolhive-operator-bundle:v0.3.5'
       catalog_image:
         description: 'Catalog image to build and push'
         required: false
@@ -25,7 +25,7 @@ on:
     - cron: '0 0 * * *'
 
 env:
-  OPERATOR_BUNDLE_IMAGE: ${{ github.event.inputs.operator_bundle_image || 'quay.io/kpais/toolhive-operator-bundle:latest' }}
+  OPERATOR_BUNDLE_IMAGE: ${{ github.event.inputs.operator_bundle_image || 'quay.io/okderators/toolhive-operator-bundle:v0.3.5' }}
   CATALOG_IMAGE: ${{ github.event.inputs.catalog_image || 'quay.io/kpais/toolhive-test-catalog:latest' }}
   CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
   REGISTRY: quay.io
