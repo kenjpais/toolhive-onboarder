@@ -364,20 +364,53 @@ jobs:
           fi
           echo "CatalogSource is READY (OKD-compatible)"
       
+      - name: Wait for catalog-operator to recognize CatalogSource
+        run: |
+          set -e
+          echo "Waiting for catalog-operator to recognize the CatalogSource..."
+          echo "This ensures the catalog-operator has refreshed its cache before we create the Subscription"
+          
+          # The catalog-operator needs time to reconcile the CatalogSource and update its internal cache
+          # We'll wait for the CatalogSource to be fully processed by checking its status
+          # and giving the catalog-operator time to sync
+          
+          MAX_WAIT=120
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Check if CatalogSource has been processed by catalog-operator
+            # The catalog-operator updates the CatalogSource status when it processes it
+            # We can check if the registryService is populated and connectionState is READY
+            CATALOG_READY=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "")
+            CATALOG_SERVICE=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.registryService.serviceName}' 2>/dev/null || echo "")
+            
+            if [ "$CATALOG_READY" = "READY" ] && [ -n "$CATALOG_SERVICE" ]; then
+              echo "CatalogSource is READY and has service registered"
+              # Give catalog-operator additional time to update its internal cache
+              echo "Waiting 15 seconds for catalog-operator to update its cache..."
+              sleep 15
+              break
+            fi
+            
+            echo "Waiting for catalog-operator to process CatalogSource... (${ELAPSED}s/${MAX_WAIT}s)"
+            echo "  Current state: $CATALOG_READY, Service: $CATALOG_SERVICE"
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+          done
+          
+          if [ "$CATALOG_READY" != "READY" ] || [ -z "$CATALOG_SERVICE" ]; then
+            echo "WARNING: CatalogSource may not be fully processed by catalog-operator"
+            echo "  State: $CATALOG_READY, Service: $CATALOG_SERVICE"
+            echo "Continuing anyway - Subscription creation will verify if catalog is recognized"
+          else
+            echo "✓ CatalogSource is recognized by catalog-operator"
+          fi
+      
       - name: Verify operator exists in catalog
         run: |
           set -e
           echo "Verifying operator 'toolhive-operator' exists in catalog..."
           
-          # Wait a bit for catalog to fully index after becoming READY
-          echo "Waiting for catalog to fully index (10 seconds)..."
-          sleep 10
-          
-          # Get catalog service endpoint
-          CATALOG_SVC="toolhive-test-catalog.openshift-marketplace.svc:50051"
-          echo "Catalog service: $CATALOG_SVC"
-          
-          # Try to verify using opm if available, or check catalog pod
+          # Get catalog pod
           CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
           if [ -z "$CATALOG_POD" ]; then
             echo "ERROR: Catalog pod not found"
@@ -391,31 +424,40 @@ jobs:
           }
           
           # Check if catalog database exists (indicates indexing)
+          # Based on our verification, the database is at /database/index.db
           echo "Verifying catalog database exists..."
-          if oc exec -n openshift-marketplace $CATALOG_POD -- test -f /configs/index.db 2>/dev/null; then
-            echo "Catalog database found - catalog is indexed"
+          if oc exec -n openshift-marketplace $CATALOG_POD -- test -f /database/index.db 2>/dev/null; then
+            echo "✓ Catalog database found at /database/index.db - catalog is indexed"
+          elif oc exec -n openshift-marketplace $CATALOG_POD -- test -f /configs/index.db 2>/dev/null; then
+            echo "✓ Catalog database found at /configs/index.db - catalog is indexed"
           else
-            echo "WARNING: Catalog database not found at /configs/index.db"
+            echo "WARNING: Catalog database not found in standard locations"
             echo "Checking alternative locations..."
             oc exec -n openshift-marketplace $CATALOG_POD -- find / -name "*.db" -type f 2>/dev/null | head -5 || true
+            echo "WARNING: Catalog may not be properly indexed"
           fi
           
-          # Try to list packages using opm (if available in cluster or we can exec into pod)
-          echo "Attempting to verify operator package in catalog..."
-          
-          # The catalog should be ready at this point, so the operator should be available
-          # OLM will handle the resolution, but we can check the catalog health
           echo "Catalog verification complete - CatalogSource is READY, operator should be resolvable"
-          echo "Note: If operator is not found, it may be a catalog indexing issue or operator name mismatch"
+          echo "Note: The actual operator resolution will be verified when Subscription is created"
       
       - name: Apply Subscription (after CatalogSource is READY)
         run: |
           set -e
-          echo "Applying Subscription (CatalogSource is now READY)..."
+          echo "Applying Subscription (CatalogSource is now READY and recognized by catalog-operator)..."
           
           # Delete existing Subscription if it exists (to recreate it fresh)
           oc delete subscription toolhive-operator -n ${{ env.OPERATOR_NS }} --ignore-not-found=true || true
-          sleep 2
+          sleep 3
+          
+          # Verify CatalogSource is still READY and healthy
+          echo "Verifying CatalogSource is still READY..."
+          CATALOG_STATE=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "Unknown")
+          if [ "$CATALOG_STATE" != "READY" ]; then
+            echo "WARNING: CatalogSource state is $CATALOG_STATE, expected READY"
+            oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml
+          else
+            echo "✓ CatalogSource is READY"
+          fi
           
           # Apply Subscription from split files
           SUBSCRIPTION_APPLIED=false
