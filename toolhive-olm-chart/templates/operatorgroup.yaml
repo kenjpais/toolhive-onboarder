@@ -6,13 +6,15 @@ metadata:
   labels:
     {{- include "toolhive-olm.labels" . | nindent 4 }}
 spec:
-  {{- if .Values.operatorGroup.targetNamespaces }}
+  {{- $targetNamespaces := .Values.operatorGroup.targetNamespaces | default list }}
+  {{- if and $targetNamespaces (gt (len $targetNamespaces) 0) }}
   targetNamespaces:
-    {{- range .Values.operatorGroup.targetNamespaces }}
+    {{- range $targetNamespaces }}
     - {{ . }}
     {{- end }}
   {{- else }}
-  # Empty targetNamespaces means all namespaces
+  # Empty targetNamespaces means all namespaces (cluster-scoped)
+  # Required for operators that install CRDs (cluster-scoped resources)
   targetNamespaces: []
   {{- end }}
 

@@ -301,10 +301,10 @@ jobs:
           echo "Rendering Helm chart..."
           # Note: OperatorGroup is cluster-scoped (empty targetNamespaces) because
           # the operator installs CRDs which are cluster-scoped resources
+          # The values.yaml already has targetNamespaces: [] as default, so we don't need to override it
           if ! helm template toolhive-olm ./toolhive-olm-chart \
             --set catalogSource.image=${{ env.CATALOG_IMAGE }} \
             --set namespace.name=${{ env.OPERATOR_NS }} \
-            --set operatorGroup.targetNamespaces=[] \
             --set subscription.channel=stable \
             --set subscription.source=toolhive-test-catalog \
             --set subscription.sourceNamespace=openshift-marketplace \
