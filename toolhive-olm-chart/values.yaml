@@ -28,9 +28,10 @@ catalogSource:
 operatorGroup:
   # -- Name of the OperatorGroup resource
   name: toolhive-operator-group
-  # -- Target namespaces for the operator (empty list means all namespaces)
-  targetNamespaces:
-    - toolhive-test-ns
+  # -- Target namespaces for the operator (empty list means all namespaces - cluster-scoped)
+  # IMPORTANT: Since the operator installs CRDs (cluster-scoped resources),
+  # the OperatorGroup must be cluster-scoped (empty targetNamespaces)
+  targetNamespaces: []
 
 # -- Subscription configuration
 subscription:
