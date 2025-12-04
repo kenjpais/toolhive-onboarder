@@ -22,3 +22,4 @@ kconfig.yaml
 .git/
 
 validate.sh
+.secrets

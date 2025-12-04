@@ -976,16 +976,65 @@ jobs:
               fi
               
               echo "Rendering catalog image: ${{ env.CATALOG_IMAGE }}"
-              RENDER_OUTPUT=$(opm render ${{ env.CATALOG_IMAGE }} 2>&1 || echo "RENDER_FAILED")
-              if echo "$RENDER_OUTPUT" | grep -qi "toolhive-operator"; then
+              echo "This may take a moment (using timeout to prevent hanging)..."
+              
+              # Use timeout to prevent hanging, capture to file for reliability
+              timeout 120 opm render ${{ env.CATALOG_IMAGE }} > /tmp/catalog-render-output.json 2>&1 || {
+                EXIT_CODE=$?
+                if [ $EXIT_CODE -eq 124 ]; then
+                  echo "RENDER_TIMEOUT" > /tmp/catalog-render-output.json
+                else
+                  echo "RENDER_FAILED (exit code: $EXIT_CODE)" >> /tmp/catalog-render-output.json
+                fi
+              }
+              
+              RENDER_OUTPUT=$(cat /tmp/catalog-render-output.json 2>/dev/null || echo "FILE_READ_FAILED")
+              
+              # Always show some output for debugging
+              echo "Render command completed. Output length: $(echo "$RENDER_OUTPUT" | wc -l) lines"
+              
+              # Check if render failed or timed out
+              if echo "$RENDER_OUTPUT" | grep -q "RENDER_TIMEOUT"; then
+                echo "✗ ERROR: opm render timed out after 120 seconds!"
+                echo "This suggests the catalog image may be corrupted or very large."
+                echo "First 50 lines of output before timeout:"
+                head -50 /tmp/catalog-render-output.json 2>/dev/null || echo "No output captured"
+                exit 1
+              elif echo "$RENDER_OUTPUT" | grep -q "RENDER_FAILED\|FILE_READ_FAILED\|error\|Error\|ERROR\|failed to pull"; then
+                echo "✗ ERROR: Failed to render catalog image!"
+                echo "This is the root cause - the catalog image cannot be rendered."
+                echo "Full render output:"
+                cat /tmp/catalog-render-output.json 2>/dev/null || echo "Could not read output file"
+                echo ""
+                echo "Possible causes:"
+                echo "1. Catalog image doesn't exist or is inaccessible"
+                echo "2. Catalog image is corrupted"
+                echo "3. Network issue pulling the image"
+                exit 1
+              elif echo "$RENDER_OUTPUT" | grep -qi "toolhive-operator"; then
                 echo "✓ Catalog image contains toolhive-operator"
-                echo "Sample output:"
-                echo "$RENDER_OUTPUT" | grep -i "toolhive-operator" | head -5
+                echo "Sample output (first 10 lines with toolhive-operator):"
+                echo "$RENDER_OUTPUT" | grep -i "toolhive-operator" | head -10
+                echo ""
+                echo "Full render output saved to /tmp/catalog-render-output.json"
+                echo "First 50 lines of full output:"
+                head -50 /tmp/catalog-render-output.json 2>/dev/null
               else
                 echo "✗ ERROR: Catalog image does NOT contain toolhive-operator!"
                 echo "This is the root cause - the catalog was built incorrectly."
-                echo "Full render output (first 50 lines):"
-                echo "$RENDER_OUTPUT" | head -50
+                echo ""
+                echo "Checking if catalog contains any OLM data..."
+                if echo "$RENDER_OUTPUT" | grep -q "olm.package\|olm.bundle\|olm.channel"; then
+                  echo "⚠ Catalog contains OLM data but not toolhive-operator"
+                  echo "Packages found in catalog:"
+                  echo "$RENDER_OUTPUT" | grep -o '"name": "[^"]*"' | head -20 || echo "Could not extract package names"
+                else
+                  echo "✗ Catalog does not contain valid OLM data!"
+                fi
+                echo ""
+                echo "Full render output (first 200 lines):"
+                head -200 /tmp/catalog-render-output.json 2>/dev/null || echo "Could not read output file"
+                exit 1
               fi
               
               # Try to query the catalog pod's gRPC endpoint
@@ -994,16 +1043,51 @@ jobs:
               CATALOG_SVC="toolhive-test-catalog.openshift-marketplace.svc:50051"
               echo "Catalog service: $CATALOG_SVC"
               
+              # Check if we can reach the service
+              echo "Checking if catalog service is reachable..."
+              if oc get svc toolhive-test-catalog -n openshift-marketplace &>/dev/null; then
+                echo "✓ Catalog service exists"
+                SVC_IP=$(oc get svc toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.spec.clusterIP}')
+                echo "Service ClusterIP: $SVC_IP"
+              else
+                echo "✗ Catalog service not found!"
+              fi
+              
               # Check if grpcurl is available
               if command -v grpcurl &> /dev/null; then
                 echo "Using grpcurl to query catalog..."
-                grpcurl -plaintext $CATALOG_SVC list 2>&1 | head -20 || echo "Could not query catalog via grpcurl"
+                GRPC_OUTPUT=$(grpcurl -plaintext -max-time 10 $CATALOG_SVC list 2>&1 || echo "GRPC_QUERY_FAILED")
+                if echo "$GRPC_OUTPUT" | grep -q "GRPC_QUERY_FAILED\|connection refused\|deadline exceeded"; then
+                  echo "✗ Could not query catalog via grpcurl"
+                  echo "Error: $GRPC_OUTPUT"
+                  echo ""
+                  echo "This suggests the catalog pod is not serving gRPC correctly."
+                else
+                  echo "✓ gRPC query succeeded"
+                  echo "Available services:"
+                  echo "$GRPC_OUTPUT" | head -20
+                fi
               else
                 echo "grpcurl not available - installing..."
-                curl -L https://github.com/fullstorydev/grpcurl/releases/download/v1.8.9/grpcurl_1.8.9_linux_x86_64.tar.gz -o /tmp/grpcurl.tar.gz
-                tar -xzf /tmp/grpcurl.tar.gz -C /tmp grpcurl
+                curl -L https://github.com/fullstorydev/grpcurl/releases/download/v1.8.9/grpcurl_1.8.9_linux_x86_64.tar.gz -o /tmp/grpcurl.tar.gz 2>&1 | head -5
+                tar -xzf /tmp/grpcurl.tar.gz -C /tmp grpcurl 2>&1 || echo "Failed to extract grpcurl"
                 chmod +x /tmp/grpcurl
-                /tmp/grpcurl -plaintext $CATALOG_SVC list 2>&1 | head -20 || echo "Could not query catalog via grpcurl"
+                GRPC_OUTPUT=$(/tmp/grpcurl -plaintext -max-time 10 $CATALOG_SVC list 2>&1 || echo "GRPC_QUERY_FAILED")
+                if echo "$GRPC_OUTPUT" | grep -q "GRPC_QUERY_FAILED\|connection refused\|deadline exceeded"; then
+                  echo "✗ Could not query catalog via grpcurl"
+                  echo "Error: $GRPC_OUTPUT"
+                else
+                  echo "✓ gRPC query succeeded"
+                  echo "$GRPC_OUTPUT" | head -20
+                fi
+              fi
+              
+              # Also check catalog pod logs for errors
+              echo ""
+              echo "=== Catalog pod logs (checking for errors) ==="
+              if [ -n "$CATALOG_POD" ]; then
+                echo "Recent catalog pod logs (last 30 lines):"
+                oc logs -n openshift-marketplace $CATALOG_POD --tail=30 2>/dev/null || echo "Could not get catalog pod logs"
               fi
             fi
             
