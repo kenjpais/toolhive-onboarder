@@ -312,9 +312,31 @@ jobs:
             echo "ERROR: Failed to render Helm chart"
             exit 1
           fi
-          echo "Helm chart rendered"
-          echo "--- Rendered manifests ---"
-          cat temp-manifests/olm-resources.yaml
+          
+          echo "Helm chart rendered successfully"
+          echo ""
+          echo "=== Verifying OperatorGroup is cluster-scoped ==="
+          
+          # Verify OperatorGroup has targetNamespaces: [] (cluster-scoped)
+          if grep -A 15 "kind: OperatorGroup" temp-manifests/olm-resources.yaml | grep -q "targetNamespaces: \[\]"; then
+            echo "✓ OperatorGroup is cluster-scoped (targetNamespaces: [])"
+            echo "OperatorGroup spec:"
+            grep -A 15 "kind: OperatorGroup" temp-manifests/olm-resources.yaml | grep -A 10 "spec:"
+          elif grep -A 15 "kind: OperatorGroup" temp-manifests/olm-resources.yaml | grep -q "targetNamespaces:"; then
+            echo "✗ ERROR: OperatorGroup has targetNamespaces set (not cluster-scoped)!"
+            echo "This will cause the subscription to fail for cluster-scoped operators."
+            echo "OperatorGroup spec:"
+            grep -A 15 "kind: OperatorGroup" temp-manifests/olm-resources.yaml | grep -A 10 "spec:"
+            exit 1
+          else
+            echo "⚠ WARNING: Could not verify targetNamespaces in OperatorGroup"
+            echo "Full OperatorGroup:"
+            grep -A 20 "kind: OperatorGroup" temp-manifests/olm-resources.yaml
+          fi
+          
+          echo ""
+          echo "--- Rendered manifests (first 100 lines) ---"
+          head -100 temp-manifests/olm-resources.yaml
       
       - name: Split and apply resources in order
         run: |
@@ -377,6 +399,24 @@ jobs:
           fi
           
           echo "Initial resources applied (CatalogSource, Namespace, OperatorGroup)"
+          
+          # CRITICAL: Verify OperatorGroup was applied correctly as cluster-scoped
+          echo ""
+          echo "=== Verifying OperatorGroup is cluster-scoped after apply ==="
+          sleep 2  # Give Kubernetes a moment to process
+          TARGET_NS=$(oc get operatorgroup toolhive-operator-group -n ${{ env.OPERATOR_NS }} -o jsonpath='{.spec.targetNamespaces[*]}' 2>/dev/null || echo "not found")
+          if [ -z "$TARGET_NS" ] || [ "$TARGET_NS" = "" ]; then
+            echo "✓ OperatorGroup is cluster-scoped (targetNamespaces: [] or empty)"
+            oc get operatorgroup toolhive-operator-group -n ${{ env.OPERATOR_NS }} -o yaml | grep -A 5 "spec:"
+          else
+            echo "✗ ERROR: OperatorGroup is NOT cluster-scoped!"
+            echo "targetNamespaces: [$TARGET_NS]"
+            echo "Full OperatorGroup:"
+            oc get operatorgroup toolhive-operator-group -n ${{ env.OPERATOR_NS }} -o yaml
+            echo ""
+            echo "This will cause the subscription to fail. The OperatorGroup must have targetNamespaces: [] for cluster-scoped operators."
+            exit 1
+          fi
       
       - name: Wait for CatalogSource to be READY (OKD standard)
         run: |
@@ -468,6 +508,19 @@ jobs:
             exit 1
           fi
           echo "CatalogSource is READY (OKD-compatible)"
+          
+          # CRITICAL: Wait for catalog-operator to process the CatalogSource
+          # Even though CatalogSource is READY, catalog-operator needs time to index it
+          echo ""
+          echo "Waiting for catalog-operator to process CatalogSource (10 seconds)..."
+          sleep 10
+          
+          # Check catalog-operator logs for processing
+          CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -n "$CATALOG_OP_POD" ]; then
+            echo "Checking catalog-operator logs for CatalogSource processing..."
+            oc logs -n olm $CATALOG_OP_POD --tail=30 2>/dev/null | grep -i "toolhive-test-catalog\|catalog.*ready" || echo "No processing logs found (this is normal)"
+          fi
       
       - name: Verify operator exists in catalog
         run: |
@@ -673,13 +726,40 @@ jobs:
           
           if [ "$INSTALLPLAN_COUNT" -eq 0 ]; then
             echo "ERROR: InstallPlan was not created"
+            echo ""
+            echo "=== CRITICAL: OperatorGroup Status ==="
+            echo "Verifying OperatorGroup is cluster-scoped (targetNamespaces: [])..."
+            oc get operatorgroup toolhive-operator-group -n ${{ env.OPERATOR_NS }} -o yaml
+            echo ""
+            echo "=== OperatorGroup spec.targetNamespaces ==="
+            TARGET_NS=$(oc get operatorgroup toolhive-operator-group -n ${{ env.OPERATOR_NS }} -o jsonpath='{.spec.targetNamespaces[*]}' 2>/dev/null || echo "not found")
+            if [ -z "$TARGET_NS" ] || [ "$TARGET_NS" = "" ]; then
+              echo "✓ OperatorGroup is cluster-scoped (targetNamespaces: [] or empty)"
+            else
+              echo "✗ ERROR: OperatorGroup is NOT cluster-scoped!"
+              echo "targetNamespaces: [$TARGET_NS]"
+              echo "This is the root cause - cluster-scoped operators require targetNamespaces: []"
+            fi
+            echo ""
             echo "=== Subscription status ==="
             oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml
+            echo ""
             echo "=== Subscription conditions ==="
             oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath='{.status.conditions[*]}' || true
             echo ""
+            echo "=== Catalog-operator logs (check for catalog processing) ==="
+            CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [ -n "$CATALOG_OP_POD" ]; then
+              echo "Catalog-operator pod: $CATALOG_OP_POD"
+              echo "Recent logs (last 50 lines, filtered for toolhive/catalog):"
+              oc logs -n olm $CATALOG_OP_POD --tail=50 2>/dev/null | grep -i "toolhive\|catalog\|error\|failed" || echo "No relevant logs found"
+            else
+              echo "Catalog-operator pod not found"
+            fi
+            echo ""
             echo "=== CatalogSource status ==="
             oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml
+            echo ""
             echo "=== Available operators in catalog ==="
             # Try to see what operators are available
             CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -687,6 +767,9 @@ jobs:
               echo "Catalog pod: $CATALOG_POD"
               oc exec -n openshift-marketplace $CATALOG_POD -- ls -la /configs 2>/dev/null || true
             fi
+            echo ""
+            echo "=== Rendered OperatorGroup (for comparison) ==="
+            grep -A 15 "kind: OperatorGroup" temp-manifests/olm-resources.yaml || echo "OperatorGroup not found in rendered manifests"
             exit 1
           fi
           
