@@ -1086,15 +1086,99 @@ jobs:
             echo "The workflow will continue, but Subscription resolution may fail"
           fi
           
+          # CRITICAL: Wait for catalog-operator to query the catalog and load operators into cache
+          # Even if connected, catalog-operator needs to query the gRPC endpoint to load operators
+          echo ""
+          echo "Step 6: Waiting for catalog-operator to query catalog and load operators into cache..."
+          FINAL_CHECK_POD=${NEW_CATALOG_OP_POD:-$CATALOG_OP_POD}
+          if [ -n "$FINAL_CHECK_POD" ]; then
+            echo "Waiting for catalog-operator to query toolhive-test-catalog for operators..."
+            MAX_QUERY_WAIT=90
+            QUERY_ELAPSED=0
+            OPERATORS_LOADED=false
+            
+            while [ $QUERY_ELAPSED -lt $MAX_QUERY_WAIT ]; do
+              # Check if catalog-operator has queried the catalog for operators
+              # Look for evidence that it's using the catalog in resolution
+              QUERY_EVIDENCE=$(oc logs -n olm $FINAL_CHECK_POD --tail=2000 2>/dev/null | grep -i "toolhive-test-catalog.*package\|toolhive-test-catalog.*bundle\|toolhive-test-catalog.*operator\|resolving.*toolhive-test-catalog.*package" || echo "")
+              
+              # Also check if catalog-operator is evaluating toolhive-test-catalog pod during resolution
+              RESOLUTION_EVIDENCE=$(oc logs -n olm $FINAL_CHECK_POD --tail=2000 2>/dev/null | grep -i "evaluating.*toolhive-test-catalog\|toolhive-test-catalog.*evaluating" || echo "")
+              
+              if [ -n "$QUERY_EVIDENCE" ] || [ -n "$RESOLUTION_EVIDENCE" ]; then
+                echo "✓ Catalog-operator has queried toolhive-test-catalog for operators!"
+                if [ -n "$QUERY_EVIDENCE" ]; then
+                  echo "Query evidence:"
+                  echo "$QUERY_EVIDENCE" | tail -3
+                fi
+                if [ -n "$RESOLUTION_EVIDENCE" ]; then
+                  echo "Resolution evidence:"
+                  echo "$RESOLUTION_EVIDENCE" | tail -3
+                fi
+                OPERATORS_LOADED=true
+                break
+              fi
+              
+              # Check if still connecting
+              if oc logs -n olm $FINAL_CHECK_POD --tail=2000 2>/dev/null | grep -qi "toolhive-test-catalog.*CONNECTING" || false; then
+                echo "Catalog-operator is still CONNECTING to catalog... (${QUERY_ELAPSED}s/${MAX_QUERY_WAIT}s)"
+              elif oc logs -n olm $FINAL_CHECK_POD --tail=2000 2>/dev/null | grep -qi "toolhive-test-catalog.*READY" || false; then
+                echo "Catalog is READY, waiting for catalog-operator to query it... (${QUERY_ELAPSED}s/${MAX_QUERY_WAIT}s)"
+              fi
+              
+              sleep 5
+              QUERY_ELAPSED=$((QUERY_ELAPSED + 5))
+            done
+            
+            if [ "$OPERATORS_LOADED" != "true" ]; then
+              echo "⚠ WARNING: Catalog-operator may not have queried the catalog for operators"
+              echo "This means operators may not be loaded into catalog-operator's resolver cache"
+              echo "Subscription resolution may still fail even though catalog is READY"
+              echo ""
+              echo "Recent catalog-operator logs (checking for query activity):"
+              oc logs -n olm $FINAL_CHECK_POD --tail=200 2>/dev/null | grep -i "toolhive\|catalog\|resolve" | tail -10 || true
+            fi
+          fi
+          
           # Don't fail the step - even if discovery didn't work, we should continue
           # The subscription step will provide better diagnostics
           echo ""
-          echo "Discovery step complete. Proceeding to Subscription creation..."
+          echo "Discovery and query step complete. Proceeding to Subscription creation..."
       
       - name: Apply Subscription (after CatalogSource is READY)
         run: |
           set -e
           echo "Applying Subscription (CatalogSource is READY and indexed)..."
+          
+          # CRITICAL: Verify catalog-operator has queried the catalog for operators
+          # Even if catalog is READY, catalog-operator needs to query it to load operators into resolver cache
+          echo "Verifying catalog-operator has queried catalog for operators..."
+          CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -n "$CATALOG_OP_POD" ]; then
+            # Check if catalog-operator has evaluated toolhive-test-catalog pod during resolution
+            # This indicates it's using the catalog in its resolver
+            RESOLUTION_CHECK=$(oc logs -n olm $CATALOG_OP_POD --tail=3000 2>/dev/null | grep -i "evaluating.*toolhive-test-catalog\|toolhive-test-catalog.*evaluating" || echo "")
+            if [ -z "$RESOLUTION_CHECK" ]; then
+              echo "⚠ WARNING: Catalog-operator has NOT evaluated toolhive-test-catalog during resolution"
+              echo "This means the catalog is connected but not being used for operator resolution"
+              echo "Forcing catalog-operator to refresh by annotating CatalogSource..."
+              oc annotate catalogsource toolhive-test-catalog -n openshift-marketplace \
+                operators.coreos.com/catalog-refresh=$(date +%s) --overwrite || true
+              echo "Waiting 15 seconds for catalog-operator to process refresh..."
+              sleep 15
+              
+              # Check again
+              RESOLUTION_CHECK=$(oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -i "evaluating.*toolhive-test-catalog\|toolhive-test-catalog.*evaluating" || echo "")
+              if [ -z "$RESOLUTION_CHECK" ]; then
+                echo "⚠ Still no evidence of catalog being used in resolution"
+                echo "This may cause subscription resolution to fail"
+              else
+                echo "✓ Catalog-operator is now evaluating toolhive-test-catalog"
+              fi
+            else
+              echo "✓ Catalog-operator has evaluated toolhive-test-catalog (catalog is in resolver cache)"
+            fi
+          fi
           
           # Delete existing Subscription if it exists (to recreate it fresh)
           oc delete subscription toolhive-operator -n ${{ env.OPERATOR_NS }} --ignore-not-found=true || true
