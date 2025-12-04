@@ -28,7 +28,9 @@ env:
   CATALOG_IMAGE: ${{ github.event.inputs.catalog_image || 'quay.io/kpais/toolhive-test-catalog:latest' }}
   CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
   REGISTRY: quay.io
-  REGISTRY_USER: kpais
+  # Use QUAY_IO_USERNAME secret if set (for robot accounts like kpais+buildcatalogbot)
+  # Otherwise defaults to kpais
+  REGISTRY_USER: ${{ secrets.QUAY_IO_USERNAME || 'kpais' }}
 
 jobs:
   build-catalog:
@@ -54,6 +56,53 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ env.REGISTRY_USER }}
           password: ${{ secrets.QUAY_IO_TOKEN }}
+        continue-on-error: false
+      
+      - name: Verify authentication and provide troubleshooting
+        if: failure()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "Quay.io Authentication Failed"
+          echo "=========================================="
+          echo ""
+          echo "The workflow failed to authenticate with Quay.io."
+          echo ""
+          echo "Current configuration:"
+          echo "  Registry: ${{ env.REGISTRY }}"
+          echo "  Username: ${{ env.REGISTRY_USER }}"
+          echo ""
+          echo "Possible causes:"
+          echo "  1. QUAY_IO_TOKEN secret is not set in GitHub repository settings"
+          echo "  2. QUAY_IO_TOKEN secret is invalid or expired"
+          echo "  3. Username is incorrect (if using robot account, set QUAY_IO_USERNAME secret)"
+          echo ""
+          echo "=========================================="
+          echo "Solution:"
+          echo "=========================================="
+          echo ""
+          echo "Step 1: Create Quay.io Token"
+          echo "  - Go to https://quay.io"
+          echo "  - Sign in → Account Settings → Applications"
+          echo "  - Create Application Token with Read & Write permissions"
+          echo "  - Copy the token (shown only once!)"
+          echo ""
+          echo "Step 2: Add Token to GitHub Secrets"
+          echo "  - Go to: https://github.com/kenjpais/toolhive-onboarder/settings/secrets/actions"
+          echo "  - Click 'New repository secret'"
+          echo "  - Name: QUAY_IO_TOKEN"
+          echo "  - Value: Paste the token from Step 1"
+          echo "  - Click 'Add secret'"
+          echo ""
+          echo "Step 3: (Optional) If using Robot Account"
+          echo "  - Also add QUAY_IO_USERNAME secret"
+          echo "  - Value: Your robot account username (e.g., kpais+buildcatalogbot)"
+          echo ""
+          echo "Step 4: Re-run the workflow"
+          echo "  - Go to Actions → Build Catalog Image → Run workflow"
+          echo ""
+          echo "For detailed instructions, see: CATALOG_BUILD.md"
+          echo "=========================================="
       
       - name: Install opm CLI
         run: |
