@@ -291,24 +291,17 @@ jobs:
             exit 1
           fi
           
-          # Verify opm binary in the image
-          echo "Verifying opm binary in catalog image..."
-          docker run --rm --platform linux/amd64 --entrypoint /bin/sh ${{ env.CATALOG_IMAGE }} -c "file /bin/opm || file /usr/bin/opm || find / -name opm -type f 2>/dev/null | head -1 | xargs file" || {
-            echo "WARNING: Could not verify opm binary, but image was built successfully"
-          }
+          # Note: The catalog image is based on a distroless image (opm:v1.35.0) which doesn't have /bin/sh
+          # We cannot run shell commands inside the container. Instead, we verify the catalog by:
+          # 1. Checking architecture (done above)
+          # 2. Using opm render to verify catalog contents (done below - most reliable)
           
-          # CRITICAL: Verify catalog database exists in the image
+          # Verify catalog database exists by checking image layers
           echo "Verifying catalog database exists in image..."
-          if docker run --rm --platform linux/amd64 --entrypoint /bin/sh ${{ env.CATALOG_IMAGE }} -c "test -f /database/index.db && echo 'Database found at /database/index.db'" 2>/dev/null; then
-            echo "✓ Catalog database found at /database/index.db"
-          elif docker run --rm --platform linux/amd64 --entrypoint /bin/sh ${{ env.CATALOG_IMAGE }} -c "test -f /configs/index.db && echo 'Database found at /configs/index.db'" 2>/dev/null; then
-            echo "✓ Catalog database found at /configs/index.db"
-          else
-            echo "ERROR: Catalog database NOT found in image!"
-            echo "Checking what files exist in the image:"
-            docker run --rm --platform linux/amd64 --entrypoint /bin/sh ${{ env.CATALOG_IMAGE }} -c "find / -name '*.db' -type f 2>/dev/null || echo 'No .db files found'" || true
-            exit 1
-          fi
+          # The database should be in /database/index.db based on the Dockerfile
+          # We can't run shell commands, but opm render will fail if database is missing
+          echo "✓ Image architecture verified (amd64)"
+          echo "  Database existence will be verified via opm render (below)"
           
           # CRITICAL: Verify we can render the catalog and it contains the operator
           echo "Verifying catalog can be rendered and contains 'toolhive-operator'..."
