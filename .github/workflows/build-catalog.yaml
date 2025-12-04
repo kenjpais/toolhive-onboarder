@@ -224,76 +224,18 @@ jobs:
           fi
           echo "✓ Catalog database size: $DB_SIZE bytes (contains data)"
           
-          # CRITICAL: Verify the catalog can be queried and contains packages
-          echo "Verifying catalog database contains operator packages..."
-          
-          # Note: opm list command is deprecated/removed in newer opm versions
-          # We'll verify by building a temporary catalog image and rendering it
-          echo "Building temporary catalog image to verify contents..."
-          
-          # Find the generated Dockerfile
-          DOCKERFILE="index.Dockerfile"
-          if [ ! -f "$DOCKERFILE" ]; then
-            DOCKERFILE=$(find . -name "*.Dockerfile" -type f | head -1)
-            if [ -z "$DOCKERFILE" ]; then
-              echo "ERROR: Could not find generated Dockerfile"
-              exit 1
-            fi
-          fi
-          
-          # Build temporary image locally (not pushed) for verification
-          TEMP_CATALOG_IMAGE="localhost/temp-catalog-verify:$(date +%s)"
-          echo "Building temporary catalog image: $TEMP_CATALOG_IMAGE"
-          
-          if docker buildx build --platform linux/amd64 --load \
-            --tag $TEMP_CATALOG_IMAGE \
-            --file "$DOCKERFILE" \
-            . 2>&1 | tee /tmp/build.log; then
-            
-            # Verify using opm render (works with catalog images)
-            echo "Rendering temporary catalog image to verify contents..."
-            RENDER_OUTPUT=$(opm render $TEMP_CATALOG_IMAGE 2>&1 || echo "RENDER_FAILED")
-            
-            if echo "$RENDER_OUTPUT" | grep -q "RENDER_FAILED"; then
-              echo "ERROR: Failed to render catalog image for verification"
-              echo "This may indicate the catalog database is corrupted"
-              exit 1
-            fi
-            
-            if echo "$RENDER_OUTPUT" | grep -q "\"package\":\s*\"toolhive-operator\"\|\"packageName\":\s*\"toolhive-operator\"\|\"name\":\s*\"toolhive-operator"; then
-              echo "✓ Operator 'toolhive-operator' found in catalog database!"
-              echo "Packages in catalog:"
-              echo "$RENDER_OUTPUT" | grep -i "package\|toolhive-operator" | head -10
-            elif echo "$RENDER_OUTPUT" | grep -qi "toolhive-operator"; then
-              echo "✓ Operator 'toolhive-operator' found in catalog database!"
-              echo "Sample catalog content:"
-              echo "$RENDER_OUTPUT" | grep -i "toolhive-operator" | head -5
-            else
-              echo "ERROR: Operator 'toolhive-operator' NOT found in catalog database!"
-              echo "Catalog contents (first 50 lines):"
-              echo "$RENDER_OUTPUT" | head -50
-              echo ""
-              echo "This indicates the bundle was not added to the catalog."
-              echo "Please check:"
-              echo "  1. The bundle image exists and is accessible: ${{ env.OPERATOR_BUNDLE_IMAGE }}"
-              echo "  2. The bundle image contains valid operator metadata"
-              echo "  3. The bundle package name matches 'toolhive-operator'"
-              echo ""
-              echo "All packages found in catalog:"
-              echo "$RENDER_OUTPUT" | grep -i "\"package\"" | head -10 || echo "No packages found"
-              exit 1
-            fi
-            
-            # Clean up temporary image
-            docker rmi $TEMP_CATALOG_IMAGE 2>/dev/null || true
-          else
-            echo "ERROR: Failed to build temporary catalog image for verification"
-            echo "Build log:"
-            cat /tmp/build.log || true
-            echo ""
-            echo "This may indicate an issue with the generated Dockerfile or database."
-            exit 1
-          fi
+          # Note: We skip database content verification here because:
+          # 1. opm list command is deprecated/removed in newer opm versions
+          # 2. Building a temporary image for verification is complex and may fail
+          # 3. We verify the final catalog image after it's built and pushed (more reliable)
+          # 
+          # The database size check above (${DB_SIZE} bytes) is a good indicator that
+          # the catalog has content. The final verification step will confirm the operator
+          # is actually in the catalog image.
+          echo "✓ Catalog database verification complete"
+          echo "  - Database exists: database/index.db"
+          echo "  - Database size: ${DB_SIZE} bytes (contains data)"
+          echo "  - Final catalog image will be verified after build and push"
       
       - name: Build and push catalog image
         run: |
@@ -368,16 +310,30 @@ jobs:
             exit 1
           fi
           
-          # CRITICAL: Verify we can render the catalog (this confirms it has actual catalog data)
-          echo "Verifying catalog can be rendered (contains actual catalog data)..."
-          if opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -5 | grep -q "olm.package\|olm.bundle\|olm.channel"; then
-            echo "✓ Catalog contains OLM data (can be rendered)"
+          # CRITICAL: Verify we can render the catalog and it contains the operator
+          echo "Verifying catalog can be rendered and contains 'toolhive-operator'..."
+          RENDER_OUTPUT=$(opm render ${{ env.CATALOG_IMAGE }} 2>&1)
+          
+          if echo "$RENDER_OUTPUT" | grep -q "toolhive-operator"; then
+            echo "✓ Catalog contains 'toolhive-operator' package!"
             echo "Sample catalog content:"
-            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -10
+            echo "$RENDER_OUTPUT" | grep -i "toolhive-operator\|package" | head -10
+          elif echo "$RENDER_OUTPUT" | head -5 | grep -q "olm.package\|olm.bundle\|olm.channel"; then
+            echo "WARNING: Catalog contains OLM data but 'toolhive-operator' not found!"
+            echo "Catalog contents (first 50 lines):"
+            echo "$RENDER_OUTPUT" | head -50
+            echo ""
+            echo "ERROR: Catalog image does not contain 'toolhive-operator' package!"
+            echo "This indicates the bundle was not added to the catalog."
+            echo "Please check:"
+            echo "  1. The bundle image exists and is accessible: ${{ env.OPERATOR_BUNDLE_IMAGE }}"
+            echo "  2. The bundle image contains valid operator metadata"
+            echo "  3. The bundle package name matches 'toolhive-operator'"
+            exit 1
           else
             echo "ERROR: Catalog image does not contain valid OLM catalog data!"
             echo "opm render output:"
-            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -20
+            echo "$RENDER_OUTPUT" | head -20
             exit 1
           fi
           
