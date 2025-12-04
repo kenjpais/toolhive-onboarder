@@ -157,10 +157,17 @@ jobs:
       - name: Prepare catalog image
         run: |
           set -e
+          echo "=========================================="
+          echo "Catalog Image Verification"
+          echo "=========================================="
           echo "Using catalog image: ${{ env.CATALOG_IMAGE }}"
+          echo ""
+          echo "NOTE: This step will verify the catalog image contains the 'toolhive-operator'."
+          echo "If verification fails, you must rebuild the catalog using the build-catalog workflow."
+          echo ""
           
           # Verify image exists and check architecture
-          echo "Verifying catalog image exists and architecture..."
+          echo "Step 1: Verifying catalog image exists and architecture..."
           if ! docker pull ${{ env.CATALOG_IMAGE }}; then
             echo "ERROR: Failed to pull catalog image: ${{ env.CATALOG_IMAGE }}"
             echo "Please ensure the image exists and is accessible"
@@ -193,29 +200,78 @@ jobs:
             export PATH=/tmp:$PATH
           fi
           
-          # Verify catalog can be rendered and contains the operator
+          # CRITICAL: Verify catalog can be rendered and contains the operator
           echo "Rendering catalog image to verify contents..."
-          if opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -q "toolhive-operator"; then
-            echo "✓ Catalog image contains 'toolhive-operator'"
-            echo "Sample catalog content:"
-            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -i "toolhive-operator\|package" | head -5
-          elif opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -q "olm.package\|olm.bundle"; then
-            echo "WARNING: Catalog contains OLM data but 'toolhive-operator' not found"
-            echo "This may indicate the catalog was built with a different bundle or is empty"
-            echo "Catalog contents:"
-            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -20
+          echo "Catalog image: ${{ env.CATALOG_IMAGE }}"
+          
+          # Capture render output for analysis
+          RENDER_OUTPUT=$(opm render ${{ env.CATALOG_IMAGE }} 2>&1 || echo "RENDER_FAILED")
+          
+          # Check if render failed
+          if echo "$RENDER_OUTPUT" | grep -q "RENDER_FAILED\|error\|Error\|ERROR"; then
+            echo "ERROR: Failed to render catalog image!"
+            echo "opm render output:"
+            echo "$RENDER_OUTPUT"
             echo ""
-            echo "ERROR: Catalog image does not contain 'toolhive-operator'"
-            echo "Please rebuild the catalog using the build-catalog workflow with:"
-            echo "  operator_bundle_image: quay.io/okderators/toolhive-operator-bundle:v0.3.5"
+            echo "The catalog image may be corrupted or inaccessible."
+            echo "Please rebuild the catalog using the build-catalog workflow."
+            exit 1
+          fi
+          
+          # Check if catalog contains toolhive-operator (exact match required)
+          if echo "$RENDER_OUTPUT" | grep -q "\"package\":\s*\"toolhive-operator\"\|\"packageName\":\s*\"toolhive-operator\"\|\"name\":\s*\"toolhive-operator"; then
+            echo "✓ Catalog image contains 'toolhive-operator' package"
+            echo "Sample catalog content:"
+            echo "$RENDER_OUTPUT" | grep -i "toolhive-operator\|package" | head -5
+          elif echo "$RENDER_OUTPUT" | grep -qi "toolhive-operator"; then
+            echo "✓ Catalog image contains 'toolhive-operator' (found in content)"
+            echo "Sample catalog content:"
+            echo "$RENDER_OUTPUT" | grep -i "toolhive-operator" | head -5
+          elif echo "$RENDER_OUTPUT" | grep -q "olm.package\|olm.bundle\|olm.channel"; then
+            echo ""
+            echo "=========================================="
+            echo "ERROR: Catalog contains OLM data but 'toolhive-operator' NOT found!"
+            echo "=========================================="
+            echo "Catalog image: ${{ env.CATALOG_IMAGE }}"
+            echo ""
+            echo "The catalog contains OLM metadata but does not include the 'toolhive-operator' package."
+            echo "This indicates the catalog was built with a different bundle or is empty."
+            echo ""
+            echo "Catalog contents (first 30 lines):"
+            echo "$RENDER_OUTPUT" | head -30
+            echo ""
+            echo "All packages found in catalog:"
+            echo "$RENDER_OUTPUT" | grep -i "\"package\"" | head -10 || echo "No packages found"
+            echo ""
+            echo "=========================================="
+            echo "SOLUTION:"
+            echo "Rebuild the catalog using the build-catalog workflow:"
+            echo "  1. Go to Actions → Build Catalog Image → Run workflow"
+            echo "  2. Ensure it uses: operator_bundle_image: quay.io/okderators/toolhive-operator-bundle:v0.3.5"
+            echo "  3. Wait for the build to complete"
+            echo "  4. Re-run this test workflow"
+            echo "=========================================="
             exit 1
           else
+            echo ""
+            echo "=========================================="
             echo "ERROR: Catalog image does not contain valid OLM catalog data!"
-            echo "opm render output:"
-            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -30
+            echo "=========================================="
+            echo "Catalog image: ${{ env.CATALOG_IMAGE }}"
             echo ""
             echo "The catalog image appears to be empty or corrupted."
-            echo "Please rebuild the catalog using the build-catalog workflow."
+            echo ""
+            echo "opm render output (first 50 lines):"
+            echo "$RENDER_OUTPUT" | head -50
+            echo ""
+            echo "=========================================="
+            echo "SOLUTION:"
+            echo "Rebuild the catalog using the build-catalog workflow:"
+            echo "  1. Go to Actions → Build Catalog Image → Run workflow"
+            echo "  2. Ensure it uses: operator_bundle_image: quay.io/okderators/toolhive-operator-bundle:v0.3.5"
+            echo "  3. Wait for the build to complete"
+            echo "  4. Re-run this test workflow"
+            echo "=========================================="
             exit 1
           fi
           
