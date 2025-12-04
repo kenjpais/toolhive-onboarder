@@ -218,9 +218,16 @@ jobs:
             exit 1
           fi
           
+          # Debug: Show what we got from opm render
+          echo "opm render output length: $(echo "$RENDER_OUTPUT" | wc -l) lines"
+          echo "First 20 lines of render output:"
+          echo "$RENDER_OUTPUT" | head -20
+          echo ""
+          
           # Check if catalog contains toolhive-operator (exact match required)
-          if echo "$RENDER_OUTPUT" | grep -q "\"package\":\s*\"toolhive-operator\"\|\"packageName\":\s*\"toolhive-operator\"\|\"name\":\s*\"toolhive-operator"; then
-            echo "✓ Catalog image contains 'toolhive-operator' package"
+          # Look for package name in various JSON formats
+          if echo "$RENDER_OUTPUT" | grep -qE '"package"\s*:\s*"toolhive-operator"|"packageName"\s*:\s*"toolhive-operator"|"name"\s*:\s*"toolhive-operator"'; then
+            echo "✓ Catalog image contains 'toolhive-operator' package (exact match)"
             echo "Sample catalog content:"
             echo "$RENDER_OUTPUT" | grep -i "toolhive-operator\|package" | head -5
           elif echo "$RENDER_OUTPUT" | grep -qi "toolhive-operator"; then

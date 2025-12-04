@@ -305,9 +305,24 @@ jobs:
           
           # CRITICAL: Verify we can render the catalog and it contains the operator
           echo "Verifying catalog can be rendered and contains 'toolhive-operator'..."
+          echo "Rendering catalog image: ${{ env.CATALOG_IMAGE }}"
           RENDER_OUTPUT=$(opm render ${{ env.CATALOG_IMAGE }} 2>&1)
+          RENDER_EXIT_CODE=$?
           
-          if echo "$RENDER_OUTPUT" | grep -q "toolhive-operator"; then
+          if [ $RENDER_EXIT_CODE -ne 0 ]; then
+            echo "ERROR: Failed to render catalog image!"
+            echo "Exit code: $RENDER_EXIT_CODE"
+            echo "opm render output:"
+            echo "$RENDER_OUTPUT"
+            exit 1
+          fi
+          
+          echo "opm render succeeded. Output length: $(echo "$RENDER_OUTPUT" | wc -l) lines"
+          echo "First 30 lines of render output:"
+          echo "$RENDER_OUTPUT" | head -30
+          echo ""
+          
+          if echo "$RENDER_OUTPUT" | grep -qE '"package"\s*:\s*"toolhive-operator"|"packageName"\s*:\s*"toolhive-operator"|"name"\s*:\s*"toolhive-operator"|toolhive-operator'; then
             echo "✓ Catalog contains 'toolhive-operator' package!"
             echo "Sample catalog content:"
             echo "$RENDER_OUTPUT" | grep -i "toolhive-operator\|package" | head -10
