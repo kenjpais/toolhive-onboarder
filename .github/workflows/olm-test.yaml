@@ -180,6 +180,46 @@ jobs:
           fi
           
           echo "Catalog image verified (architecture: $ARCH)"
+          
+          # CRITICAL: Verify catalog contains operator before deploying
+          echo "Verifying catalog image contains 'toolhive-operator'..."
+          
+          # Install opm CLI if not available
+          if ! command -v opm &> /dev/null; then
+            echo "Installing opm CLI for catalog verification..."
+            OPM_VERSION=v1.35.0
+            curl -L https://github.com/operator-framework/operator-registry/releases/download/${OPM_VERSION}/linux-amd64-opm -o /tmp/opm
+            chmod +x /tmp/opm
+            export PATH=/tmp:$PATH
+          fi
+          
+          # Verify catalog can be rendered and contains the operator
+          echo "Rendering catalog image to verify contents..."
+          if opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -q "toolhive-operator"; then
+            echo "✓ Catalog image contains 'toolhive-operator'"
+            echo "Sample catalog content:"
+            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -i "toolhive-operator\|package" | head -5
+          elif opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -q "olm.package\|olm.bundle"; then
+            echo "WARNING: Catalog contains OLM data but 'toolhive-operator' not found"
+            echo "This may indicate the catalog was built with a different bundle or is empty"
+            echo "Catalog contents:"
+            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -20
+            echo ""
+            echo "ERROR: Catalog image does not contain 'toolhive-operator'"
+            echo "Please rebuild the catalog using the build-catalog workflow with:"
+            echo "  operator_bundle_image: quay.io/okderators/toolhive-operator-bundle:v0.3.5"
+            exit 1
+          else
+            echo "ERROR: Catalog image does not contain valid OLM catalog data!"
+            echo "opm render output:"
+            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -30
+            echo ""
+            echo "The catalog image appears to be empty or corrupted."
+            echo "Please rebuild the catalog using the build-catalog workflow."
+            exit 1
+          fi
+          
+          echo "Catalog image verified - contains operator and correct architecture"
           echo "Note: Catalog image will be pulled by the cluster when CatalogSource is created"
           echo "If using a local image, it would need to be loaded into KIND:"
           echo "  kind load docker-image ${{ env.CATALOG_IMAGE }} --name ${{ env.CLUSTER_NAME }}"
@@ -417,58 +457,92 @@ jobs:
             export PATH=/tmp:$PATH
           fi
           
-          # Get catalog service endpoint
-          CATALOG_SVC="toolhive-test-catalog.openshift-marketplace.svc:50051"
-          echo "Catalog service: $CATALOG_SVC"
-          
-          # Try to list packages from the catalog
-          echo "Attempting to list packages from catalog..."
-          MAX_ATTEMPTS=5
-          ATTEMPT=0
+          # CRITICAL: First verify the catalog image directly (most reliable method)
+          echo "Step 1: Verifying catalog image contains operator..."
           OPERATOR_FOUND=false
           
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            ATTEMPT=$((ATTEMPT + 1))
-            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Querying catalog for packages..."
-            
-            # Try to query the catalog using opm (via port-forward or direct service)
-            # First, try to exec into the pod and use opm there
-            if oc exec -n openshift-marketplace $CATALOG_POD -- opm list 2>/dev/null | grep -q "toolhive-operator"; then
-              echo "✓ Operator 'toolhive-operator' found in catalog!"
-              OPERATOR_FOUND=true
-              break
-            fi
-            
-            # Alternative: Try to render the catalog image directly
-            if opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -q "toolhive-operator"; then
-              echo "✓ Operator 'toolhive-operator' found in catalog image!"
-              OPERATOR_FOUND=true
-              break
-            fi
-            
-            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
-              echo "Operator not found yet, waiting 5 seconds before retry..."
-              sleep 5
-            fi
-          done
+          # Try to render the catalog image directly - this is the most reliable check
+          echo "Rendering catalog image: ${{ env.CATALOG_IMAGE }}"
+          CATALOG_RENDER_OUTPUT=$(opm render ${{ env.CATALOG_IMAGE }} 2>&1 || echo "")
           
+          if echo "$CATALOG_RENDER_OUTPUT" | grep -q "toolhive-operator"; then
+            echo "✓ Operator 'toolhive-operator' found in catalog image!"
+            OPERATOR_FOUND=true
+          elif echo "$CATALOG_RENDER_OUTPUT" | grep -q "olm.package\|olm.bundle\|olm.channel"; then
+            echo "WARNING: Catalog contains OLM data but 'toolhive-operator' not found"
+            echo "Catalog contents:"
+            echo "$CATALOG_RENDER_OUTPUT" | head -30
+          else
+            echo "ERROR: Catalog image does not contain valid OLM data!"
+            echo "opm render output:"
+            echo "$CATALOG_RENDER_OUTPUT" | head -30
+          fi
+          
+          # Step 2: Also try querying the catalog pod (secondary check)
           if [ "$OPERATOR_FOUND" != "true" ]; then
             echo ""
+            echo "Step 2: Attempting to query catalog pod..."
+            MAX_ATTEMPTS=3
+            ATTEMPT=0
+            
+            while [ $ATTEMPT -lt $MAX_ATTEMPTS ] && [ "$OPERATOR_FOUND" != "true" ]; do
+              ATTEMPT=$((ATTEMPT + 1))
+              echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Querying catalog pod..."
+              
+              # Try to exec into the pod and use opm there (if opm is available in pod)
+              if oc exec -n openshift-marketplace $CATALOG_POD -- opm list 2>/dev/null | grep -q "toolhive-operator"; then
+                echo "✓ Operator 'toolhive-operator' found in catalog pod!"
+                OPERATOR_FOUND=true
+                break
+              fi
+              
+              if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                echo "Operator not found in pod, waiting 3 seconds before retry..."
+                sleep 3
+              fi
+            done
+          fi
+          
+          # Final check - fail if operator not found
+          if [ "$OPERATOR_FOUND" != "true" ]; then
+            echo ""
+            echo "=========================================="
             echo "ERROR: Operator 'toolhive-operator' NOT found in catalog!"
-            echo ""
-            echo "=== Diagnostic Information ==="
-            echo "Catalog pod logs:"
-            oc logs -n openshift-marketplace $CATALOG_POD --tail=50 || true
-            echo ""
-            echo "Attempting to list all packages in catalog:"
-            oc exec -n openshift-marketplace $CATALOG_POD -- opm list 2>&1 || echo "Could not list packages"
+            echo "=========================================="
             echo ""
             echo "Catalog image: ${{ env.CATALOG_IMAGE }}"
-            echo "Attempting to render catalog image:"
-            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -30 || echo "Could not render catalog"
             echo ""
-            echo "This indicates the catalog image may be empty or the operator bundle was not added correctly."
-            echo "Please rebuild the catalog using the build-catalog workflow."
+            echo "=== Diagnostic Information ==="
+            echo ""
+            echo "1. Catalog pod status:"
+            oc get pod $CATALOG_POD -n openshift-marketplace -o yaml | grep -A 5 "status:" || true
+            echo ""
+            echo "2. Catalog pod logs:"
+            oc logs -n openshift-marketplace $CATALOG_POD --tail=50 || true
+            echo ""
+            echo "3. Catalog image render output:"
+            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -50 || echo "Could not render catalog"
+            echo ""
+            echo "4. Attempting to list packages from catalog pod:"
+            oc exec -n openshift-marketplace $CATALOG_POD -- opm list 2>&1 || echo "Could not list packages (opm may not be in pod)"
+            echo ""
+            echo "5. CatalogSource status:"
+            oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml | grep -A 10 "status:" || true
+            echo ""
+            echo "=========================================="
+            echo "SOLUTION:"
+            echo "The catalog image appears to be empty or was built with an incompatible bundle."
+            echo ""
+            echo "1. Rebuild the catalog using the build-catalog workflow:"
+            echo "   - Go to Actions → Build Catalog Image → Run workflow"
+            echo "   - Ensure it uses: quay.io/okderators/toolhive-operator-bundle:v0.3.5"
+            echo ""
+            echo "2. Verify the bundle image is AMD64:"
+            echo "   docker inspect quay.io/okderators/toolhive-operator-bundle:v0.3.5 --format '{{.Architecture}}'"
+            echo "   Should output: amd64"
+            echo ""
+            echo "3. After rebuilding, the catalog image will contain the operator"
+            echo "=========================================="
             exit 1
           fi
           
