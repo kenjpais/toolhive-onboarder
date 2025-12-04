@@ -364,107 +364,14 @@ jobs:
           fi
           echo "CatalogSource is READY (OKD-compatible)"
       
-      - name: Force catalog-operator to reconcile CatalogSource
-        run: |
-          set -e
-          echo "Forcing catalog-operator to reconcile CatalogSource to ensure it's loaded into resolver cache..."
-          
-          # Verify CatalogSource is READY first
-          CATALOG_READY=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "")
-          if [ "$CATALOG_READY" != "READY" ]; then
-            echo "ERROR: CatalogSource is not READY (state: $CATALOG_READY)"
-            exit 1
-          fi
-          
-          echo "CatalogSource is READY, forcing reconciliation..."
-          
-          # Force reconciliation by adding/updating an annotation
-          # This triggers the catalog-operator to reconcile the CatalogSource
-          # and load it into the resolver cache
-          oc annotate catalogsource toolhive-test-catalog -n openshift-marketplace \
-            olm.cache.refresh="$(date +%s)" \
-            --overwrite || {
-            echo "WARNING: Failed to annotate CatalogSource, trying alternative method"
-            # Alternative: patch the CatalogSource to trigger reconciliation
-            oc patch catalogsource toolhive-test-catalog -n openshift-marketplace \
-              --type merge -p '{"metadata":{"annotations":{"olm.cache.refresh":"'$(date +%s)'"}}}' || true
-          }
-          
-          echo "CatalogSource annotated to trigger reconciliation"
-          
-          # Wait for catalog-operator to process the reconciliation
-          echo "Waiting for catalog-operator to reconcile CatalogSource and load into resolver cache..."
-          MAX_WAIT=90
-          ELAPSED=0
-          RECONCILED=false
-          
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            # Check catalog-operator logs for reconciliation activity
-            # Look for messages about syncing or processing our catalog
-            if oc logs -n olm -l app=catalog-operator --tail=100 2>/dev/null | grep -q "toolhive-test-catalog"; then
-              echo "Catalog-operator has processed toolhive-test-catalog in logs"
-              RECONCILED=true
-              # Give it additional time to update resolver cache
-              echo "Waiting 20 seconds for resolver cache to be updated..."
-              sleep 20
-              break
-            fi
-            
-            echo "Waiting for catalog-operator reconciliation... (${ELAPSED}s/${MAX_WAIT}s)"
-            sleep 5
-            ELAPSED=$((ELAPSED + 5))
-          done
-          
-          if [ "$RECONCILED" != "true" ]; then
-            echo "WARNING: Could not confirm catalog-operator has processed toolhive-test-catalog from logs"
-            echo "Waiting additional 30 seconds to allow cache update..."
-            sleep 30
-          fi
-          
-          # Final wait to ensure resolver cache is fully updated
-          echo "Final wait for resolver cache synchronization..."
-          sleep 15
-          
-          echo "CatalogSource reconciliation complete - resolver cache should be updated"
-      
-      - name: Verify catalog is queryable
-        run: |
-          set -e
-          echo "Verifying catalog is queryable and contains operators..."
-          
-          # Get catalog service endpoint
-          CATALOG_SVC="toolhive-test-catalog.openshift-marketplace.svc:50051"
-          CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-          
-          if [ -z "$CATALOG_POD" ]; then
-            echo "ERROR: Catalog pod not found"
-            exit 1
-          fi
-          
-          echo "Catalog pod: $CATALOG_POD"
-          echo "Catalog service: $CATALOG_SVC"
-          
-          # Verify the catalog pod is actually serving
-          echo "Checking if catalog pod is serving gRPC..."
-          if oc exec -n openshift-marketplace $CATALOG_POD -- pgrep -f opm > /dev/null 2>&1; then
-            echo "✓ Catalog pod process is running"
-          else
-            echo "WARNING: Could not verify catalog pod process"
-          fi
-          
-          # Check if we can reach the service
-          echo "Checking catalog service connectivity..."
-          if oc run -n openshift-marketplace --rm -i --restart=Never --image=curlimages/curl:latest test-catalog-connect -- \
-            curl -s http://toolhive-test-catalog.openshift-marketplace.svc:50051 > /dev/null 2>&1 || true; then
-            echo "Catalog service is reachable (gRPC endpoint may require gRPC client)"
-          fi
-          
-          echo "Catalog verification complete - ready for Subscription"
-      
       - name: Verify operator exists in catalog
         run: |
           set -e
           echo "Verifying operator 'toolhive-operator' exists in catalog..."
+          
+          # Wait a bit for catalog to fully index after becoming READY
+          echo "Waiting for catalog to fully index (15 seconds)..."
+          sleep 15
           
           # Get catalog pod
           CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -476,44 +383,105 @@ jobs:
           echo "Catalog pod: $CATALOG_POD"
           echo "Checking catalog pod is running..."
           oc wait --for=condition=Ready pod/$CATALOG_POD -n openshift-marketplace --timeout=60s || {
-            echo "WARNING: Catalog pod not ready, but continuing..."
+            echo "ERROR: Catalog pod not ready"
+            exit 1
           }
           
           # Check if catalog database exists (indicates indexing)
-          # Based on our verification, the database is at /database/index.db
           echo "Verifying catalog database exists..."
-          if oc exec -n openshift-marketplace $CATALOG_POD -- test -f /database/index.db 2>/dev/null; then
-            echo "✓ Catalog database found at /database/index.db - catalog is indexed"
-          elif oc exec -n openshift-marketplace $CATALOG_POD -- test -f /configs/index.db 2>/dev/null; then
-            echo "✓ Catalog database found at /configs/index.db - catalog is indexed"
+          DB_FOUND=false
+          if oc exec -n openshift-marketplace $CATALOG_POD -- test -f /configs/index.db 2>/dev/null; then
+            echo "✓ Catalog database found at /configs/index.db"
+            DB_FOUND=true
+          elif oc exec -n openshift-marketplace $CATALOG_POD -- test -f /database/index.db 2>/dev/null; then
+            echo "✓ Catalog database found at /database/index.db"
+            DB_FOUND=true
           else
-            echo "WARNING: Catalog database not found in standard locations"
-            echo "Checking alternative locations..."
-            oc exec -n openshift-marketplace $CATALOG_POD -- find / -name "*.db" -type f 2>/dev/null | head -5 || true
-            echo "WARNING: Catalog may not be properly indexed"
+            echo "ERROR: Catalog database not found!"
+            echo "Checking what files exist in the catalog pod:"
+            oc exec -n openshift-marketplace $CATALOG_POD -- find / -name "*.db" -type f 2>/dev/null | head -10 || true
+            echo "Listing /configs and /database directories:"
+            oc exec -n openshift-marketplace $CATALOG_POD -- ls -la /configs /database 2>/dev/null || true
+            exit 1
           fi
           
-          echo "Catalog verification complete - CatalogSource is READY, operator should be resolvable"
-          echo "Note: The actual operator resolution will be verified when Subscription is created"
+          # CRITICAL: Verify operator package exists in catalog using opm
+          echo "Verifying operator package 'toolhive-operator' exists in catalog..."
+          
+          # Install opm CLI if not available
+          if ! command -v opm &> /dev/null; then
+            echo "Installing opm CLI for catalog verification..."
+            OPM_VERSION=v1.35.0
+            curl -L https://github.com/operator-framework/operator-registry/releases/download/${OPM_VERSION}/linux-amd64-opm -o /tmp/opm
+            chmod +x /tmp/opm
+            export PATH=/tmp:$PATH
+          fi
+          
+          # Get catalog service endpoint
+          CATALOG_SVC="toolhive-test-catalog.openshift-marketplace.svc:50051"
+          echo "Catalog service: $CATALOG_SVC"
+          
+          # Try to list packages from the catalog
+          echo "Attempting to list packages from catalog..."
+          MAX_ATTEMPTS=5
+          ATTEMPT=0
+          OPERATOR_FOUND=false
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Querying catalog for packages..."
+            
+            # Try to query the catalog using opm (via port-forward or direct service)
+            # First, try to exec into the pod and use opm there
+            if oc exec -n openshift-marketplace $CATALOG_POD -- opm list 2>/dev/null | grep -q "toolhive-operator"; then
+              echo "✓ Operator 'toolhive-operator' found in catalog!"
+              OPERATOR_FOUND=true
+              break
+            fi
+            
+            # Alternative: Try to render the catalog image directly
+            if opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -q "toolhive-operator"; then
+              echo "✓ Operator 'toolhive-operator' found in catalog image!"
+              OPERATOR_FOUND=true
+              break
+            fi
+            
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "Operator not found yet, waiting 5 seconds before retry..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$OPERATOR_FOUND" != "true" ]; then
+            echo ""
+            echo "ERROR: Operator 'toolhive-operator' NOT found in catalog!"
+            echo ""
+            echo "=== Diagnostic Information ==="
+            echo "Catalog pod logs:"
+            oc logs -n openshift-marketplace $CATALOG_POD --tail=50 || true
+            echo ""
+            echo "Attempting to list all packages in catalog:"
+            oc exec -n openshift-marketplace $CATALOG_POD -- opm list 2>&1 || echo "Could not list packages"
+            echo ""
+            echo "Catalog image: ${{ env.CATALOG_IMAGE }}"
+            echo "Attempting to render catalog image:"
+            opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -30 || echo "Could not render catalog"
+            echo ""
+            echo "This indicates the catalog image may be empty or the operator bundle was not added correctly."
+            echo "Please rebuild the catalog using the build-catalog workflow."
+            exit 1
+          fi
+          
+          echo "✓ Catalog verification complete - operator 'toolhive-operator' is available in catalog"
       
       - name: Apply Subscription (after CatalogSource is READY)
         run: |
           set -e
-          echo "Applying Subscription (CatalogSource is now READY and recognized by catalog-operator)..."
+          echo "Applying Subscription (CatalogSource is now READY)..."
           
           # Delete existing Subscription if it exists (to recreate it fresh)
           oc delete subscription toolhive-operator -n ${{ env.OPERATOR_NS }} --ignore-not-found=true || true
-          sleep 3
-          
-          # Verify CatalogSource is still READY and healthy
-          echo "Verifying CatalogSource is still READY..."
-          CATALOG_STATE=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "Unknown")
-          if [ "$CATALOG_STATE" != "READY" ]; then
-            echo "WARNING: CatalogSource state is $CATALOG_STATE, expected READY"
-            oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml
-          else
-            echo "✓ CatalogSource is READY"
-          fi
+          sleep 2
           
           # Apply Subscription from split files
           SUBSCRIPTION_APPLIED=false
@@ -543,127 +511,44 @@ jobs:
           echo "=== Subscription status ==="
           oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml || true
       
-      - name: Wait for Subscription to resolve operator
+      - name: Wait for operator installation (OKD OLM)
         run: |
           set -e
-          echo "Waiting for Subscription to resolve the operator from catalog..."
-          echo "This ensures the catalog-operator's resolver has recognized the catalog"
+          echo "Waiting for InstallPlan (OKD OLM)..."
           
-          MAX_WAIT=300  # Wait up to 5 minutes for resolution (increased from 3 minutes)
+          # First, wait for InstallPlan to be created
+          echo "Waiting for InstallPlan to be created..."
+          MAX_WAIT=120
           ELAPSED=0
-          RESOLVED=false
-          LAST_CATALOG_LOG_CHECK=0
-          
           while [ $ELAPSED -lt $MAX_WAIT ]; do
-            # Check Subscription conditions
-            UNHEALTHY=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath='{.status.conditions[?(@.type=="CatalogSourcesUnhealthy")].status}' 2>/dev/null || echo "")
-            RESOLUTION_FAILED=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath='{.status.conditions[?(@.type=="ResolutionFailed")].status}' 2>/dev/null || echo "")
-            
-            # Check if InstallPlan exists (indicates successful resolution)
             INSTALLPLAN_COUNT=$(oc get installplan -n ${{ env.OPERATOR_NS }} -l "operators.coreos.com/toolhive-operator.${{ env.OPERATOR_NS }}" --no-headers 2>/dev/null | wc -l || echo "0")
-            
             if [ "$INSTALLPLAN_COUNT" -gt 0 ]; then
-              echo "✓ InstallPlan created - operator resolved successfully!"
-              RESOLVED=true
+              echo "InstallPlan found"
               break
             fi
-            
-            # If catalog is still reported as unhealthy, wait longer and check catalog-operator activity
-            if [ "$UNHEALTHY" = "True" ] || [ "$RESOLUTION_FAILED" = "True" ]; then
-              echo "Subscription still cannot resolve (${ELAPSED}s/${MAX_WAIT}s)..."
-              echo "  CatalogSourcesUnhealthy: $UNHEALTHY"
-              echo "  ResolutionFailed: $RESOLUTION_FAILED"
-              
-              # Every 30 seconds, check catalog-operator logs and CatalogSource status
-              if [ $((ELAPSED - LAST_CATALOG_LOG_CHECK)) -ge 30 ]; then
-                echo "  === Diagnostic check ==="
-                echo "  Current Subscription conditions:"
-                oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath='{.status.conditions[*].type}' 2>/dev/null | tr ' ' '\n' | while read type; do
-                  status=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath="{.status.conditions[?(@.type==\"$type\")].status}" 2>/dev/null || echo "")
-                  reason=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath="{.status.conditions[?(@.type==\"$type\")].reason}" 2>/dev/null || echo "")
-                  message=$(oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath="{.status.conditions[?(@.type==\"$type\")].message}" 2>/dev/null || echo "")
-                  echo "    $type: $status ($reason)"
-                  if [ -n "$message" ]; then
-                    echo "      Message: $message"
-                  fi
-                done || true
-                
-                echo "  CatalogSource status:"
-                CATALOG_STATE=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "Unknown")
-                echo "    State: $CATALOG_STATE"
-                
-                echo "  Checking if catalog-operator has processed toolhive-test-catalog..."
-                if oc logs -n olm -l app=catalog-operator --tail=100 2>/dev/null | grep -q "toolhive-test-catalog"; then
-                  echo "    ✓ Found in catalog-operator logs"
-                else
-                  echo "    ✗ Not found in catalog-operator logs (catalog may not be loaded into resolver cache)"
-                fi
-                
-                # Try to force another reconciliation if we're past 60 seconds
-                if [ $ELAPSED -ge 60 ] && [ $((ELAPSED % 60)) -eq 0 ]; then
-                  echo "  Forcing CatalogSource reconciliation again..."
-                  oc annotate catalogsource toolhive-test-catalog -n openshift-marketplace \
-                    olm.cache.refresh="$(date +%s)" \
-                    --overwrite 2>/dev/null || true
-                fi
-                
-                LAST_CATALOG_LOG_CHECK=$ELAPSED
-              fi
-            else
-              echo "Subscription is processing... (${ELAPSED}s/${MAX_WAIT}s)"
-            fi
-            
+            echo "Waiting for InstallPlan to be created... (${ELAPSED}s/${MAX_WAIT}s)"
             sleep 5
             ELAPSED=$((ELAPSED + 5))
           done
           
-          if [ "$RESOLVED" != "true" ]; then
-            echo "ERROR: Subscription failed to resolve operator after ${MAX_WAIT} seconds"
-            echo ""
-            echo "=== Full Diagnostic Information ==="
-            echo ""
+          if [ "$INSTALLPLAN_COUNT" -eq 0 ]; then
+            echo "ERROR: InstallPlan was not created"
             echo "=== Subscription status ==="
             oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml
-            echo ""
-            echo "=== Subscription conditions (detailed) ==="
+            echo "=== Subscription conditions ==="
             oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o jsonpath='{.status.conditions[*]}' || true
-            echo ""
             echo ""
             echo "=== CatalogSource status ==="
             oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml
-            echo ""
-            echo "=== Catalog pod status ==="
-            oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog
-            echo ""
-            echo "=== Catalog-operator logs (last 100 lines) ==="
-            oc logs -n olm -l app=catalog-operator --tail=100 || true
-            echo ""
-            echo "=== Catalog-operator logs (filtered for toolhive-test-catalog) ==="
-            oc logs -n olm -l app=catalog-operator --tail=500 2>/dev/null | grep -i "toolhive" || echo "No mentions of toolhive in logs"
-            echo ""
-            echo "=== All CatalogSources ==="
-            oc get catalogsource -A
+            echo "=== Available operators in catalog ==="
+            # Try to see what operators are available
+            CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [ -n "$CATALOG_POD" ]; then
+              echo "Catalog pod: $CATALOG_POD"
+              oc exec -n openshift-marketplace $CATALOG_POD -- ls -la /configs 2>/dev/null || true
+            fi
             exit 1
           fi
-          
-          echo "Subscription has successfully resolved the operator"
-      
-      - name: Wait for operator installation (OKD OLM)
-        run: |
-          set -e
-          echo "Waiting for InstallPlan to complete (OKD OLM)..."
-          echo "Note: InstallPlan should already exist from previous step"
-          
-          # Verify InstallPlan exists (should have been created in previous step)
-          INSTALLPLAN_COUNT=$(oc get installplan -n ${{ env.OPERATOR_NS }} -l "operators.coreos.com/toolhive-operator.${{ env.OPERATOR_NS }}" --no-headers 2>/dev/null | wc -l || echo "0")
-          if [ "$INSTALLPLAN_COUNT" -eq 0 ]; then
-            echo "ERROR: InstallPlan was not created (this should have been caught in previous step)"
-            echo "=== Subscription status ==="
-            oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml
-            exit 1
-          fi
-          
-          echo "InstallPlan found, waiting for it to complete..."
           
           # Now wait for InstallPlan to complete
           if ! timeout 300 bash -c 'until oc get installplan -n ${{ env.OPERATOR_NS }} -l "operators.coreos.com/toolhive-operator.${{ env.OPERATOR_NS }}" 2>/dev/null | grep -q Complete; do sleep 5; done'; then
