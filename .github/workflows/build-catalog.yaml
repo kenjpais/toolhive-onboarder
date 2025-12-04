@@ -251,12 +251,12 @@ jobs:
             if [ ! -f "$DOCKERFILE" ]; then
               # Find any Dockerfile in current directory
               DOCKERFILE=$(find . -maxdepth 1 -name "*.Dockerfile" -type f | head -1)
-              if [ -z "$DOCKERFILE" ]; then
+            if [ -z "$DOCKERFILE" ]; then
                 echo "ERROR: Could not find generated Dockerfile"
                 echo "Expected: index.Dockerfile or catalog-index.Dockerfile"
                 echo "Files in current directory:"
                 ls -la *.Dockerfile 2>/dev/null || echo "No Dockerfile found"
-                exit 1
+              exit 1
               fi
             fi
           fi

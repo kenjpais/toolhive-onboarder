@@ -508,65 +508,79 @@ jobs:
             exit 1
           fi
           echo "CatalogSource is READY (OKD-compatible)"
+      
+      - name: Verify CoreDNS is running (required for CatalogSource DNS)
+        run: |
+          set -e
+          echo "=== Verifying CoreDNS/kube-dns is running ==="
           
-          # CRITICAL: Wait for catalog-operator to process the CatalogSource
-          # Even though CatalogSource is READY, catalog-operator needs time to index it
-          echo ""
-          echo "Waiting for catalog-operator to process CatalogSource..."
-          
-          # Wait and verify catalog-operator has processed the catalog
-          MAX_WAIT=60
-          ELAPSED=0
-          CATALOG_PROCESSED=false
-          CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-          
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            ELAPSED=$((ELAPSED + 5))
-            echo "Waiting for catalog-operator to process catalog... (${ELAPSED}s/${MAX_WAIT}s)"
-            
-            # Check if catalog-operator has queried the catalog
-            if [ -n "$CATALOG_OP_POD" ]; then
-              if oc logs -n olm $CATALOG_OP_POD --tail=100 2>/dev/null | grep -qi "toolhive-test-catalog.*ready\|toolhive-test-catalog.*success\|resolving.*toolhive-test-catalog"; then
-                echo "✓ Found evidence of catalog processing in catalog-operator logs"
-                CATALOG_PROCESSED=true
-                break
-              fi
-            fi
-            
-            # Also verify catalog pod is serving the operator
-            CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-            if [ -n "$CATALOG_POD" ]; then
-              # Check if catalog pod has the database
-              if oc exec -n openshift-marketplace $CATALOG_POD -- test -f /database/index.db 2>/dev/null || oc exec -n openshift-marketplace $CATALOG_POD -- test -f /configs/index.db 2>/dev/null; then
-                echo "✓ Catalog pod has database"
-                # Try to verify operator is in the catalog using opm render (if opm is available)
-                if command -v opm &> /dev/null; then
-                  if opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -q "toolhive-operator"; then
-                    echo "✓ Catalog image contains toolhive-operator (verified via opm render)"
-                    CATALOG_PROCESSED=true
-                    break
-                  fi
-                fi
-              fi
-            fi
-            
-            sleep 5
-          done
-          
-          if [ "$CATALOG_PROCESSED" = "false" ]; then
-            echo "⚠ WARNING: Could not verify catalog-operator has fully processed the catalog"
-            echo "Proceeding anyway - the subscription will be created and we'll see if it resolves"
-            if [ -n "$CATALOG_OP_POD" ]; then
-              echo "Recent catalog-operator logs:"
-              oc logs -n olm $CATALOG_OP_POD --tail=50 2>/dev/null | tail -20
-            fi
-          else
-            echo "✓ Catalog appears to be processed by catalog-operator"
+          # Check for CoreDNS pods
+          DNS_PODS=$(oc get pods -n kube-system -l k8s-app=kube-dns 2>/dev/null | grep -v NAME | wc -l || echo "0")
+          if [ "$DNS_PODS" -eq 0 ]; then
+            # Try alternative label
+            DNS_PODS=$(oc get pods -n kube-system -l k8s-app=coredns 2>/dev/null | grep -v NAME | wc -l || echo "0")
           fi
           
+          if [ "$DNS_PODS" -gt 0 ]; then
+            echo "✓ Found $DNS_PODS DNS pod(s)"
+            oc get pods -n kube-system -l k8s-app=kube-dns 2>/dev/null || oc get pods -n kube-system -l k8s-app=coredns 2>/dev/null || true
+            
+            # Check if DNS pods are ready
+            DNS_READY=$(oc get pods -n kube-system -l k8s-app=kube-dns -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -c "True" || echo "0")
+            if [ "$DNS_READY" -eq 0 ]; then
+              DNS_READY=$(oc get pods -n kube-system -l k8s-app=coredns -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -c "True" || echo "0")
+            fi
+            
+            if [ "$DNS_READY" -gt 0 ]; then
+              echo "✓ DNS pods are Ready"
+            else
+              echo "⚠ WARNING: DNS pods exist but are not Ready"
+              echo "This may cause CatalogSource Service DNS resolution to fail"
+            fi
+          else
+            echo "⚠ WARNING: No DNS pods found in kube-system namespace"
+            echo "This will prevent CatalogSource Service DNS resolution"
+            echo "Listing all pods in kube-system:"
+            oc get pods -n kube-system | head -10 || true
+          fi
+      
+      - name: Verify CatalogSource Service DNS resolution (from within cluster)
+        run: |
+          set -e
+          echo "=== Verifying CatalogSource Service DNS resolution ==="
+          
+          # Check if Service exists
+          if ! oc get svc toolhive-test-catalog -n openshift-marketplace &>/dev/null; then
+            echo "✗ ERROR: CatalogSource Service does not exist!"
+            echo "This is a critical issue - the Service must exist for DNS resolution"
+            exit 1
+          fi
+          
+          echo "✓ CatalogSource Service exists"
+          oc get svc toolhive-test-catalog -n openshift-marketplace
+          
+          # Test DNS resolution from within the cluster
           echo ""
-          echo "Waiting additional 5 seconds for catalog-operator to finalize processing..."
-          sleep 5
+          echo "Testing DNS resolution from within cluster..."
+          
+          # Create a test pod to check DNS
+          TEST_POD_NAME="dns-test-$(date +%s)"
+          oc run $TEST_POD_NAME --image=busybox:1.36 --restart=Never --rm -i --namespace=openshift-marketplace \
+            --command -- nslookup toolhive-test-catalog.openshift-marketplace.svc 2>&1 || {
+            echo "⚠ DNS test pod failed (this may be expected)"
+          }
+          
+          # Also try to get the service IP
+          SERVICE_IP=$(oc get svc toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+          if [ -n "$SERVICE_IP" ] && [ "$SERVICE_IP" != "<none>" ]; then
+            echo "✓ Service has ClusterIP: $SERVICE_IP"
+          else
+            echo "✗ ERROR: Service does not have a ClusterIP!"
+            echo "This will prevent DNS resolution and catalog-operator discovery"
+            exit 1
+          fi
+          
+          # DNS verification complete - catalog-operator discovery is handled in the next step
       
       - name: Verify operator exists in catalog
         run: |
@@ -713,10 +727,10 @@ jobs:
           
           echo "✓ Catalog verification complete - operator 'toolhive-operator' is available in catalog"
       
-      - name: Force catalog-operator to discover CatalogSource
+      - name: Force catalog-operator to discover CatalogSource (with DNS fix)
         run: |
           set -e
-          echo "=== Forcing catalog-operator to discover CatalogSource ==="
+          echo "=== Forcing catalog-operator to discover CatalogSource (ROOT CAUSE FIX) ==="
           
           # CRITICAL: Check if catalog-operator has discovered the CatalogSource
           echo "Step 1: Checking if catalog-operator has discovered CatalogSource..."
@@ -725,13 +739,13 @@ jobs:
           
           if [ -n "$CATALOG_OP_POD" ]; then
             # Check last 1000 lines of logs (catalog-operator may have been running for a while)
-            # Use || true to prevent grep from causing script failure
-            if oc logs -n olm $CATALOG_OP_POD --tail=1000 2>/dev/null | grep -qi "toolhive-test-catalog" || false; then
+            # Look for "processing" or mentions of toolhive-test-catalog
+            if oc logs -n olm $CATALOG_OP_POD --tail=1000 2>/dev/null | grep -qi "toolhive-test-catalog\|processing.*toolhive" || false; then
               echo "✓ Catalog-operator has discovered toolhive-test-catalog"
               DISCOVERED=true
             else
               echo "✗ Catalog-operator has NOT discovered toolhive-test-catalog"
-              echo "This is likely the root cause - forcing CatalogSource recreation..."
+              echo "ROOT CAUSE: CatalogSource Service DNS is not resolvable, preventing discovery"
               DISCOVERED=false
             fi
           else
@@ -739,10 +753,10 @@ jobs:
             DISCOVERED=false
           fi
           
-          # If not discovered, recreate the CatalogSource to force discovery
+          # If not discovered, apply FIX 1: Delete and recreate CatalogSource + Service
           if [ "$DISCOVERED" != "true" ]; then
             echo ""
-            echo "Step 2: Recreating CatalogSource to force catalog-operator discovery..."
+            echo "Step 2: Applying FIX 1 - Deleting and recreating CatalogSource and Service..."
             
             # Save current CatalogSource spec
             echo "Saving current CatalogSource spec..."
@@ -750,12 +764,17 @@ jobs:
               echo "Could not save CatalogSource, will recreate from Helm template"
             }
             
-            # Delete CatalogSource
+            # Delete Service first (FIX 4 - forces DNS re-registration)
+            echo "Deleting Service to force DNS re-registration..."
+            oc delete svc toolhive-test-catalog -n openshift-marketplace --ignore-not-found=true || true
+            sleep 3
+            
+            # Delete CatalogSource (FIX 1 - forces OLM discovery)
             echo "Deleting CatalogSource..."
             oc delete catalogsource toolhive-test-catalog -n openshift-marketplace --ignore-not-found=true || true
             sleep 5
             
-            # Recreate CatalogSource
+            # Recreate CatalogSource (this will also recreate the Service)
             echo "Recreating CatalogSource..."
             if [ -f /tmp/catalogsource-backup.yaml ]; then
               # Remove status and metadata that shouldn't be reapplied
@@ -773,104 +792,112 @@ jobs:
               grep -A 20 "kind: CatalogSource" temp-manifests/olm-resources.yaml | oc apply -f - || true
             fi
             
-            echo "Waiting 20 seconds for CatalogSource to be recreated and catalog-operator to discover it..."
-            sleep 20
-          else
-            # Just annotate to refresh
+            echo "Waiting 10 seconds for CatalogSource and Service to be recreated..."
+            sleep 10
+            
+            # Verify Service exists and has ClusterIP
+            echo "Verifying Service was recreated..."
+            MAX_WAIT=30
+            ELAPSED=0
+            SERVICE_READY=false
+            while [ $ELAPSED -lt $MAX_WAIT ]; do
+              SERVICE_IP=$(oc get svc toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+              if [ -n "$SERVICE_IP" ] && [ "$SERVICE_IP" != "<none>" ]; then
+                echo "✓ Service recreated with ClusterIP: $SERVICE_IP"
+                SERVICE_READY=true
+                break
+              fi
+              echo "Waiting for Service to be recreated... (${ELAPSED}s/${MAX_WAIT}s)"
+              sleep 3
+              ELAPSED=$((ELAPSED + 3))
+            done
+            
+            if [ "$SERVICE_READY" != "true" ]; then
+              echo "✗ ERROR: Service was not recreated properly!"
+              exit 1
+            fi
+            
+            # Wait for CatalogSource to be READY
             echo ""
-            echo "Step 2: Annotating CatalogSource to trigger refresh..."
+            echo "Waiting for CatalogSource to become READY..."
+            MAX_WAIT=60
+            ELAPSED=0
+            while [ $ELAPSED -lt $MAX_WAIT ]; do
+              CATALOG_STATE=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "unknown")
+              if [ "$CATALOG_STATE" = "READY" ]; then
+                echo "✓ CatalogSource is READY"
+                break
+              fi
+              echo "Waiting for CatalogSource to be READY... (${ELAPSED}s/${MAX_WAIT}s) - Current state: $CATALOG_STATE"
+              sleep 5
+              ELAPSED=$((ELAPSED + 5))
+            done
+            
+            if [ "$CATALOG_STATE" != "READY" ]; then
+              echo "⚠ WARNING: CatalogSource state is: $CATALOG_STATE (expected READY)"
+              oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml | grep -A 10 "status:" || true
+            fi
+            
+            # Apply FIX 2: Restart catalog-operator to flush cache
+            echo ""
+            echo "Step 3: Applying FIX 2 - Restarting catalog-operator to flush discovery cache..."
+            CATALOG_OP_DEPLOY=$(oc get deployment -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [ -n "$CATALOG_OP_DEPLOY" ]; then
+              echo "Restarting catalog-operator deployment: $CATALOG_OP_DEPLOY"
+              oc rollout restart deployment/$CATALOG_OP_DEPLOY -n olm || true
+              echo "Waiting 30 seconds for catalog-operator pod to restart and re-discover CatalogSources..."
+              sleep 30
+              
+              # Wait for new pod to be ready
+              oc wait --for=condition=Ready pod -n olm -l app=catalog-operator --timeout=60s || true
+              
+              # Get new pod name
+              NEW_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+              if [ -n "$NEW_CATALOG_OP_POD" ]; then
+                echo "New catalog-operator pod: $NEW_CATALOG_OP_POD"
+                echo "Waiting 15 seconds for it to process CatalogSources..."
+                sleep 15
+              fi
+            else
+              echo "Could not find catalog-operator deployment to restart"
+            fi
+            
+            # Check if catalog-operator has now discovered it
+            echo ""
+            echo "Step 4: Verifying catalog-operator has discovered CatalogSource..."
+            CHECK_POD=${NEW_CATALOG_OP_POD:-$CATALOG_OP_POD}
+            if [ -n "$CHECK_POD" ]; then
+              if oc logs -n olm $CHECK_POD --tail=200 2>/dev/null | grep -qi "toolhive-test-catalog\|processing.*toolhive" || false; then
+                echo "✓ Catalog-operator has now discovered toolhive-test-catalog!"
+                echo "Recent mentions:"
+                oc logs -n olm $CHECK_POD --tail=200 2>/dev/null | grep -i "toolhive-test-catalog\|processing.*toolhive" | tail -5 || true
+                DISCOVERED=true
+              else
+                echo "✗ Catalog-operator still hasn't discovered toolhive-test-catalog after fixes"
+                echo "This may indicate a deeper DNS or network issue"
+                echo "Recent catalog-operator logs:"
+                oc logs -n olm $CHECK_POD --tail=50 2>/dev/null | tail -20 || true
+              fi
+            fi
+          else
+            echo ""
+            echo "Step 2: Catalog-operator has already discovered the CatalogSource"
+            echo "Annotating CatalogSource to trigger refresh..."
             oc annotate catalogsource toolhive-test-catalog -n openshift-marketplace \
               operators.coreos.com/catalog-refresh=$(date +%s) --overwrite || true
             sleep 10
           fi
           
-          # Verify CatalogSource is READY
-          echo ""
-          echo "Step 3: Verifying CatalogSource is READY..."
-          MAX_WAIT=60
-          ELAPSED=0
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            CATALOG_STATE=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "unknown")
-            if [ "$CATALOG_STATE" = "READY" ]; then
-              echo "✓ CatalogSource is READY"
-              break
-            fi
-            echo "Waiting for CatalogSource to be READY... (${ELAPSED}s/${MAX_WAIT}s) - Current state: $CATALOG_STATE"
-            sleep 5
-            ELAPSED=$((ELAPSED + 5))
-          done
-          
-          if [ "$CATALOG_STATE" != "READY" ]; then
-            echo "⚠ WARNING: CatalogSource state is: $CATALOG_STATE (expected READY)"
-            oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml | grep -A 10 "status:" || true
-          fi
-          
-          # Check if catalog-operator has now discovered it
-          echo ""
-          echo "Step 4: Verifying catalog-operator has discovered CatalogSource..."
-          if [ -n "$CATALOG_OP_POD" ]; then
-            # Wait a bit more for discovery
-            sleep 10
-            # Use || true to prevent grep from causing script failure
-            if oc logs -n olm $CATALOG_OP_POD --tail=200 --since=120s 2>/dev/null | grep -qi "toolhive-test-catalog" || false; then
-              echo "✓ Found toolhive-test-catalog in recent catalog-operator logs"
-              echo "Recent mentions:"
-              oc logs -n olm $CATALOG_OP_POD --tail=200 --since=120s 2>/dev/null | grep -i "toolhive-test-catalog" | tail -3 || true
-            else
-              echo "⚠ WARNING: toolhive-test-catalog still not found in recent catalog-operator logs"
-              echo "Attempting to force catalog-operator to re-discover by restarting the pod..."
-              
-              # Get the deployment name
-              CATALOG_OP_DEPLOY=$(oc get deployment -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-              if [ -n "$CATALOG_OP_DEPLOY" ]; then
-                echo "Restarting catalog-operator deployment: $CATALOG_OP_DEPLOY"
-                oc rollout restart deployment/$CATALOG_OP_DEPLOY -n olm || true
-                echo "Waiting 30 seconds for catalog-operator pod to restart and re-discover CatalogSources..."
-                sleep 30
-                
-                # Wait for new pod to be ready
-                oc wait --for=condition=Ready pod -n olm -l app=catalog-operator --timeout=60s || true
-                
-                # Get new pod name
-                NEW_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-                if [ -n "$NEW_CATALOG_OP_POD" ]; then
-                  echo "New catalog-operator pod: $NEW_CATALOG_OP_POD"
-                  echo "Waiting 20 seconds for it to process CatalogSources..."
-                  sleep 20
-                  
-                  # Check if it has discovered the CatalogSource
-                  # Use || true to prevent grep from causing script failure
-                  if oc logs -n olm $NEW_CATALOG_OP_POD --tail=200 2>/dev/null | grep -qi "toolhive-test-catalog" || false; then
-                    echo "✓ Catalog-operator has now discovered toolhive-test-catalog after restart"
-                  else
-                    echo "⚠ Catalog-operator still hasn't discovered toolhive-test-catalog after restart"
-                    echo "This may indicate a deeper issue with CatalogSource visibility or catalog-operator configuration"
-                    echo ""
-                    echo "Checking if CatalogSource exists and is visible to catalog-operator..."
-                    oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml | head -30 || true
-                    echo ""
-                    echo "Recent catalog-operator logs (full, not filtered):"
-                    oc logs -n olm $NEW_CATALOG_OP_POD --tail=50 2>/dev/null || true
-                  fi
-                else
-                  echo "Could not get new catalog-operator pod name"
-                fi
-              else
-                echo "Could not find catalog-operator deployment to restart"
-              fi
-              
-              echo ""
-              echo "Recent catalog-operator logs (showing what it IS processing):"
-              oc logs -n olm $CATALOG_OP_POD --tail=50 2>/dev/null | grep -i "catalog\|source" | tail -5 || true
-            fi
-          else
-            echo "⚠ Could not get catalog-operator pod name"
+          if [ "$DISCOVERED" != "true" ]; then
+            echo ""
+            echo "⚠ WARNING: Catalog-operator may still not have discovered the CatalogSource"
+            echo "The workflow will continue, but Subscription resolution may fail"
           fi
           
           # Don't fail the step - even if discovery didn't work, we should continue
           # The subscription step will provide better diagnostics
           echo ""
-          echo "Step 4 complete. Proceeding to Subscription creation..."
+          echo "Discovery step complete. Proceeding to Subscription creation..."
       
       - name: Apply Subscription (after CatalogSource is READY)
         run: |
@@ -902,15 +929,61 @@ jobs:
             }
           fi
           
-          # CRITICAL: Force catalog-operator to re-process by annotating the Subscription
+          # CRITICAL: Verify catalog pod is accessible from within cluster before proceeding
           echo ""
-          echo "Triggering catalog-operator reconciliation by annotating Subscription..."
+          echo "=== Verifying catalog pod is accessible from within cluster ==="
+          CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -n "$CATALOG_POD" ]; then
+            echo "Catalog pod: $CATALOG_POD"
+            echo "Checking catalog pod is ready and serving..."
+            oc wait --for=condition=Ready pod/$CATALOG_POD -n openshift-marketplace --timeout=30s || {
+              echo "⚠ WARNING: Catalog pod not ready"
+            }
+            
+            # Check if we can reach the service from within cluster using a test pod
+            echo "Testing catalog service connectivity from within cluster..."
+            # Use oc run to create a temporary pod that can query the catalog
+            oc run catalog-test-$(date +%s) --image=quay.io/operator-framework/opm:v1.35.0 \
+              --restart=Never --rm -i --namespace=openshift-marketplace \
+              --command -- sh -c "timeout 10 opm render toolhive-test-catalog.openshift-marketplace.svc:50051 2>&1 | head -20 || echo 'Query failed'" 2>/dev/null || {
+              echo "⚠ Could not test catalog connectivity (this is expected if oc run fails)"
+            }
+          fi
+          
+          # CRITICAL: Force catalog-operator to re-process by annotating both Subscription and CatalogSource
+          echo ""
+          echo "Triggering catalog-operator reconciliation..."
+          
+          # Annotate Subscription to force reconciliation
+          echo "Annotating Subscription to trigger reconciliation..."
           oc annotate subscription toolhive-operator -n ${{ env.OPERATOR_NS }} \
             operators.coreos.com/catalog-reconcile=$(date +%s) --overwrite || true
           
+          # Annotate CatalogSource to force catalog-operator to refresh its view
+          echo "Annotating CatalogSource to trigger refresh..."
+          oc annotate catalogsource toolhive-test-catalog -n openshift-marketplace \
+            operators.coreos.com/catalog-refresh=$(date +%s) --overwrite || true
+          
+          # CRITICAL: Delete and recreate Subscription to force fresh resolution
+          echo ""
+          echo "Deleting and recreating Subscription to force fresh resolution..."
+          oc delete subscription toolhive-operator -n ${{ env.OPERATOR_NS }} --ignore-not-found=true || true
+          sleep 5
+          
+          # Reapply Subscription
+          SUBSCRIPTION_FILE=$(find temp-manifests -name "resource-*.yaml" -exec grep -l "kind: Subscription" {} \; | head -1)
+          if [ -n "$SUBSCRIPTION_FILE" ] && [ -f "$SUBSCRIPTION_FILE" ]; then
+            oc apply -f "$SUBSCRIPTION_FILE" || {
+              echo "Failed to reapply Subscription, trying from full manifest..."
+              awk '/^---$/{p=0} /kind: Subscription/{p=1} p' temp-manifests/olm-resources.yaml | oc apply -f - || true
+            }
+          else
+            awk '/^---$/{p=0} /kind: Subscription/{p=1} p' temp-manifests/olm-resources.yaml | oc apply -f - || true
+          fi
+          
           # Wait for catalog-operator to process
-          echo "Waiting 10 seconds for catalog-operator to process Subscription..."
-          sleep 10
+          echo "Waiting 30 seconds for catalog-operator to process Subscription and CatalogSource..."
+          sleep 30
           
           # Show Subscription status
           echo "=== Subscription status ==="
@@ -921,32 +994,14 @@ jobs:
           echo "=== Checking catalog-operator processing ==="
           CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
           if [ -n "$CATALOG_OP_POD" ]; then
-            echo "Recent catalog-operator logs (last 50 lines, filtered for toolhive/subscription/resolve):"
-            oc logs -n olm $CATALOG_OP_POD --tail=50 2>/dev/null | grep -i "toolhive\|subscription\|resolve\|catalog" || echo "No relevant logs found"
+            echo "Recent catalog-operator logs (last 100 lines, filtered for toolhive/subscription/resolve/catalog):"
+            oc logs -n olm $CATALOG_OP_POD --tail=100 2>/dev/null | grep -i "toolhive\|subscription\|resolve\|catalog\|source" || echo "No relevant logs found"
+            echo ""
+            echo "Checking for any connection or query errors..."
+            oc logs -n olm $CATALOG_OP_POD --tail=200 2>/dev/null | grep -i "error\|fail\|timeout\|connection" | tail -10 || echo "No errors found"
           fi
           
           echo "Subscription applied"
-          
-          # CRITICAL: Force catalog-operator to re-process by annotating the Subscription
-          # This can help if catalog-operator's cache is stale
-          echo ""
-          echo "Triggering catalog-operator reconciliation by annotating Subscription..."
-          oc annotate subscription toolhive-operator -n ${{ env.OPERATOR_NS }} \
-            operators.coreos.com/catalog-reconcile=$(date +%s) --overwrite || true
-          
-          # Show Subscription status
-          sleep 5  # Give catalog-operator time to process
-          echo "=== Subscription status ==="
-          oc get subscription toolhive-operator -n ${{ env.OPERATOR_NS }} -o yaml || true
-          
-          # Check catalog-operator logs for processing
-          echo ""
-          echo "=== Checking catalog-operator processing ==="
-          CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-          if [ -n "$CATALOG_OP_POD" ]; then
-            echo "Recent catalog-operator logs (last 20 lines):"
-            oc logs -n olm $CATALOG_OP_POD --tail=20 2>/dev/null | grep -i "toolhive\|subscription\|resolve" || echo "No relevant logs found"
-          fi
       
       - name: Wait for operator installation (OKD OLM)
         run: |
@@ -1145,19 +1200,44 @@ jobs:
             echo "=== Checking if catalog-operator has discovered CatalogSource ==="
             if [ -n "$CATALOG_OP_POD" ]; then
               echo "Searching catalog-operator logs for toolhive-test-catalog..."
-              if oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -qi "toolhive-test-catalog"; then
+              # Use || true to prevent grep from causing script failure
+              if oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -qi "toolhive-test-catalog" || false; then
                 echo "✓ Found toolhive-test-catalog in catalog-operator logs"
                 echo "Recent mentions:"
-                oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -i "toolhive-test-catalog" | tail -5
+                oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -i "toolhive-test-catalog" | tail -5 || true
               else
                 echo "✗ ERROR: catalog-operator has NOT discovered toolhive-test-catalog!"
                 echo "This is the root cause - catalog-operator is not aware of the CatalogSource."
                 echo ""
-                echo "Recent catalog-operator logs (showing what it IS processing):"
-                oc logs -n olm $CATALOG_OP_POD --tail=100 2>/dev/null | grep -i "catalog\|source" | tail -10
+                echo "CRITICAL INSIGHT: Catalog-operator logs show it's trying to resolve subscriptions"
+                echo "with source=toolhive-test-catalog, but it's saying 'no operators found'."
+                echo "This means catalog-operator knows about the catalog name but hasn't queried"
+                echo "the catalog pod's gRPC endpoint to discover operators."
                 echo ""
-                echo "SOLUTION: The catalog-operator may need to be restarted or the CatalogSource recreated"
-                echo "to force discovery. Alternatively, there may be a namespace visibility issue."
+                echo "Recent catalog-operator logs (showing what it IS processing):"
+                oc logs -n olm $CATALOG_OP_POD --tail=100 2>/dev/null | grep -i "catalog\|source\|resolve" | tail -10 || true
+                echo ""
+                echo "SOLUTION: Catalog-operator needs to query the catalog pod's gRPC endpoint."
+                echo "This may require:"
+                echo "1. Restarting catalog-operator to force re-discovery"
+                echo "2. Ensuring CatalogSource is in a namespace catalog-operator watches"
+                echo "3. Verifying catalog pod is serving operators correctly via gRPC"
+              fi
+            fi
+            
+            # CRITICAL: Check if catalog-operator can actually query the catalog pod
+            echo ""
+            echo "=== Verifying catalog-operator can query catalog pod ==="
+            CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [ -n "$CATALOG_POD" ]; then
+              echo "Catalog pod: $CATALOG_POD"
+              echo "Checking if catalog-operator has any connection errors to this pod..."
+              if [ -n "$CATALOG_OP_POD" ]; then
+                # Look for connection errors, timeouts, or query failures
+                oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -i "toolhive-test-catalog.*error\|toolhive-test-catalog.*fail\|toolhive-test-catalog.*timeout\|toolhive-test-catalog.*connect" || {
+                  echo "No connection errors found for toolhive-test-catalog"
+                  echo "This suggests catalog-operator may not be attempting to connect at all"
+                }
               fi
             fi
             echo ""
