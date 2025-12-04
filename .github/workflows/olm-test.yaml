@@ -713,42 +713,113 @@ jobs:
           
           echo "✓ Catalog verification complete - operator 'toolhive-operator' is available in catalog"
       
-      - name: Force catalog-operator to refresh CatalogSource
+      - name: Force catalog-operator to discover CatalogSource
         run: |
           set -e
-          echo "=== Forcing catalog-operator to refresh CatalogSource ==="
+          echo "=== Forcing catalog-operator to discover CatalogSource ==="
           
-          # Annotate CatalogSource to trigger catalog-operator refresh
-          echo "Annotating CatalogSource to trigger catalog-operator refresh..."
-          oc annotate catalogsource toolhive-test-catalog -n openshift-marketplace \
-            operators.coreos.com/catalog-refresh=$(date +%s) --overwrite || true
-          
-          # Wait for catalog-operator to process
-          echo "Waiting 10 seconds for catalog-operator to process CatalogSource refresh..."
-          sleep 10
-          
-          # Check catalog-operator logs to see if it's processing the CatalogSource
+          # CRITICAL: Check if catalog-operator has discovered the CatalogSource
+          echo "Step 1: Checking if catalog-operator has discovered CatalogSource..."
           CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          DISCOVERED=false
+          
           if [ -n "$CATALOG_OP_POD" ]; then
-            echo "Checking catalog-operator logs for CatalogSource processing..."
-            if oc logs -n olm $CATALOG_OP_POD --tail=50 --since=30s 2>/dev/null | grep -qi "toolhive-test-catalog"; then
-              echo "✓ Found toolhive-test-catalog in catalog-operator logs"
+            # Check last 1000 lines of logs (catalog-operator may have been running for a while)
+            if oc logs -n olm $CATALOG_OP_POD --tail=1000 2>/dev/null | grep -qi "toolhive-test-catalog"; then
+              echo "✓ Catalog-operator has discovered toolhive-test-catalog"
+              DISCOVERED=true
             else
-              echo "⚠ WARNING: toolhive-test-catalog not found in recent catalog-operator logs"
-              echo "Recent logs (last 20 lines):"
-              oc logs -n olm $CATALOG_OP_POD --tail=20 2>/dev/null | tail -10
+              echo "✗ Catalog-operator has NOT discovered toolhive-test-catalog"
+              echo "This is likely the root cause - forcing CatalogSource recreation..."
+              DISCOVERED=false
             fi
+          else
+            echo "⚠ Could not check catalog-operator logs"
+            DISCOVERED=false
           fi
           
-          # Verify CatalogSource is still READY
-          echo ""
-          echo "Verifying CatalogSource is still READY..."
-          CATALOG_STATE=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "unknown")
-          if [ "$CATALOG_STATE" = "READY" ]; then
-            echo "✓ CatalogSource is READY"
+          # If not discovered, recreate the CatalogSource to force discovery
+          if [ "$DISCOVERED" != "true" ]; then
+            echo ""
+            echo "Step 2: Recreating CatalogSource to force catalog-operator discovery..."
+            
+            # Save current CatalogSource spec
+            echo "Saving current CatalogSource spec..."
+            oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml > /tmp/catalogsource-backup.yaml 2>/dev/null || {
+              echo "Could not save CatalogSource, will recreate from Helm template"
+            }
+            
+            # Delete CatalogSource
+            echo "Deleting CatalogSource..."
+            oc delete catalogsource toolhive-test-catalog -n openshift-marketplace --ignore-not-found=true || true
+            sleep 5
+            
+            # Recreate CatalogSource
+            echo "Recreating CatalogSource..."
+            if [ -f /tmp/catalogsource-backup.yaml ]; then
+              # Remove status and metadata that shouldn't be reapplied
+              grep -v "^  status:" /tmp/catalogsource-backup.yaml | \
+                grep -v "^  resourceVersion:" | \
+                grep -v "^  uid:" | \
+                grep -v "^  generation:" | \
+                grep -v "^  creationTimestamp:" | \
+                oc apply -f - || {
+                echo "Failed to recreate from backup, using Helm template..."
+                grep -A 20 "kind: CatalogSource" temp-manifests/olm-resources.yaml | oc apply -f - || true
+              }
+            else
+              # Fallback to applying from template
+              grep -A 20 "kind: CatalogSource" temp-manifests/olm-resources.yaml | oc apply -f - || true
+            fi
+            
+            echo "Waiting 20 seconds for CatalogSource to be recreated and catalog-operator to discover it..."
+            sleep 20
           else
+            # Just annotate to refresh
+            echo ""
+            echo "Step 2: Annotating CatalogSource to trigger refresh..."
+            oc annotate catalogsource toolhive-test-catalog -n openshift-marketplace \
+              operators.coreos.com/catalog-refresh=$(date +%s) --overwrite || true
+            sleep 10
+          fi
+          
+          # Verify CatalogSource is READY
+          echo ""
+          echo "Step 3: Verifying CatalogSource is READY..."
+          MAX_WAIT=60
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            CATALOG_STATE=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "unknown")
+            if [ "$CATALOG_STATE" = "READY" ]; then
+              echo "✓ CatalogSource is READY"
+              break
+            fi
+            echo "Waiting for CatalogSource to be READY... (${ELAPSED}s/${MAX_WAIT}s) - Current state: $CATALOG_STATE"
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+          done
+          
+          if [ "$CATALOG_STATE" != "READY" ]; then
             echo "⚠ WARNING: CatalogSource state is: $CATALOG_STATE (expected READY)"
             oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml | grep -A 10 "status:" || true
+          fi
+          
+          # Check if catalog-operator has now discovered it
+          echo ""
+          echo "Step 4: Verifying catalog-operator has discovered CatalogSource..."
+          if [ -n "$CATALOG_OP_POD" ]; then
+            # Wait a bit more for discovery
+            sleep 10
+            if oc logs -n olm $CATALOG_OP_POD --tail=200 --since=120s 2>/dev/null | grep -qi "toolhive-test-catalog"; then
+              echo "✓ Found toolhive-test-catalog in recent catalog-operator logs"
+              echo "Recent mentions:"
+              oc logs -n olm $CATALOG_OP_POD --tail=200 --since=120s 2>/dev/null | grep -i "toolhive-test-catalog" | tail -3
+            else
+              echo "⚠ WARNING: toolhive-test-catalog still not found in recent catalog-operator logs"
+              echo "This may indicate a deeper issue with catalog-operator discovery"
+              echo "Recent catalog-operator logs (showing what it IS processing):"
+              oc logs -n olm $CATALOG_OP_POD --tail=50 2>/dev/null | grep -i "catalog\|source" | tail -5
+            fi
           fi
       
       - name: Apply Subscription (after CatalogSource is READY)
@@ -892,14 +963,67 @@ jobs:
               oc exec -n openshift-marketplace $CATALOG_POD -- ls -la /configs 2>/dev/null || echo "Could not list /configs"
               oc exec -n openshift-marketplace $CATALOG_POD -- ls -la /database 2>/dev/null || echo "Could not list /database"
               
-              # Try to verify operator is in catalog using opm render
+              # CRITICAL: Verify catalog image contains operator using opm render
               echo ""
               echo "=== Verifying catalog image contains operator ==="
-              if command -v opm &> /dev/null; then
-                echo "Using opm render to verify catalog image:"
-                opm render ${{ env.CATALOG_IMAGE }} 2>&1 | grep -i "toolhive-operator" | head -10 || echo "WARNING: toolhive-operator not found in catalog image render"
+              # Install opm if not available
+              if ! command -v opm &> /dev/null; then
+                echo "Installing opm for verification..."
+                OPM_VERSION=v1.35.0
+                curl -L https://github.com/operator-framework/operator-registry/releases/download/${OPM_VERSION}/linux-amd64-opm -o /tmp/opm
+                chmod +x /tmp/opm
+                export PATH=/tmp:$PATH
+              fi
+              
+              echo "Rendering catalog image: ${{ env.CATALOG_IMAGE }}"
+              RENDER_OUTPUT=$(opm render ${{ env.CATALOG_IMAGE }} 2>&1 || echo "RENDER_FAILED")
+              if echo "$RENDER_OUTPUT" | grep -qi "toolhive-operator"; then
+                echo "✓ Catalog image contains toolhive-operator"
+                echo "Sample output:"
+                echo "$RENDER_OUTPUT" | grep -i "toolhive-operator" | head -5
               else
-                echo "opm not available for verification"
+                echo "✗ ERROR: Catalog image does NOT contain toolhive-operator!"
+                echo "This is the root cause - the catalog was built incorrectly."
+                echo "Full render output (first 50 lines):"
+                echo "$RENDER_OUTPUT" | head -50
+              fi
+              
+              # Try to query the catalog pod's gRPC endpoint
+              echo ""
+              echo "=== Attempting to query catalog pod gRPC endpoint ==="
+              CATALOG_SVC="toolhive-test-catalog.openshift-marketplace.svc:50051"
+              echo "Catalog service: $CATALOG_SVC"
+              
+              # Check if grpcurl is available
+              if command -v grpcurl &> /dev/null; then
+                echo "Using grpcurl to query catalog..."
+                grpcurl -plaintext $CATALOG_SVC list 2>&1 | head -20 || echo "Could not query catalog via grpcurl"
+              else
+                echo "grpcurl not available - installing..."
+                curl -L https://github.com/fullstorydev/grpcurl/releases/download/v1.8.9/grpcurl_1.8.9_linux_x86_64.tar.gz -o /tmp/grpcurl.tar.gz
+                tar -xzf /tmp/grpcurl.tar.gz -C /tmp grpcurl
+                chmod +x /tmp/grpcurl
+                /tmp/grpcurl -plaintext $CATALOG_SVC list 2>&1 | head -20 || echo "Could not query catalog via grpcurl"
+              fi
+            fi
+            
+            echo ""
+            echo "=== Checking if catalog-operator has discovered CatalogSource ==="
+            if [ -n "$CATALOG_OP_POD" ]; then
+              echo "Searching catalog-operator logs for toolhive-test-catalog..."
+              if oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -qi "toolhive-test-catalog"; then
+                echo "✓ Found toolhive-test-catalog in catalog-operator logs"
+                echo "Recent mentions:"
+                oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -i "toolhive-test-catalog" | tail -5
+              else
+                echo "✗ ERROR: catalog-operator has NOT discovered toolhive-test-catalog!"
+                echo "This is the root cause - catalog-operator is not aware of the CatalogSource."
+                echo ""
+                echo "Recent catalog-operator logs (showing what it IS processing):"
+                oc logs -n olm $CATALOG_OP_POD --tail=100 2>/dev/null | grep -i "catalog\|source" | tail -10
+                echo ""
+                echo "SOLUTION: The catalog-operator may need to be restarted or the CatalogSource recreated"
+                echo "to force discovery. Alternatively, there may be a namespace visibility issue."
               fi
             fi
             echo ""
