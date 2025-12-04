@@ -545,8 +545,9 @@ jobs:
               ATTEMPT=$((ATTEMPT + 1))
               echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Querying catalog pod..."
               
-              # Try to exec into the pod and use opm there (if opm is available in pod)
-              if oc exec -n openshift-marketplace $CATALOG_POD -- opm list 2>/dev/null | grep -q "toolhive-operator"; then
+              # Try to exec into the pod and use opm render (opm list is deprecated/removed)
+              # Note: opm may not be available in the catalog pod, so this is a best-effort check
+              if oc exec -n openshift-marketplace $CATALOG_POD -- opm render quay.io/kpais/toolhive-test-catalog:latest 2>/dev/null | grep -q "toolhive-operator"; then
                 echo "✓ Operator 'toolhive-operator' found in catalog pod!"
                 OPERATOR_FOUND=true
                 break
@@ -579,8 +580,8 @@ jobs:
             echo "3. Catalog image render output:"
             opm render ${{ env.CATALOG_IMAGE }} 2>&1 | head -50 || echo "Could not render catalog"
             echo ""
-            echo "4. Attempting to list packages from catalog pod:"
-            oc exec -n openshift-marketplace $CATALOG_POD -- opm list 2>&1 || echo "Could not list packages (opm may not be in pod)"
+            echo "4. Attempting to render catalog from pod:"
+            oc exec -n openshift-marketplace $CATALOG_POD -- opm render quay.io/kpais/toolhive-test-catalog:latest 2>&1 | head -30 || echo "Could not render catalog (opm may not be in pod or image not accessible)"
             echo ""
             echo "5. CatalogSource status:"
             oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o yaml | grep -A 10 "status:" || true
