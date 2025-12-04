@@ -816,7 +816,38 @@ jobs:
               oc logs -n olm $CATALOG_OP_POD --tail=200 --since=120s 2>/dev/null | grep -i "toolhive-test-catalog" | tail -3
             else
               echo "⚠ WARNING: toolhive-test-catalog still not found in recent catalog-operator logs"
-              echo "This may indicate a deeper issue with catalog-operator discovery"
+              echo "Attempting to force catalog-operator to re-discover by restarting the pod..."
+              
+              # Get the deployment name
+              CATALOG_OP_DEPLOY=$(oc get deployment -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+              if [ -n "$CATALOG_OP_DEPLOY" ]; then
+                echo "Restarting catalog-operator deployment: $CATALOG_OP_DEPLOY"
+                oc rollout restart deployment/$CATALOG_OP_DEPLOY -n olm || true
+                echo "Waiting 30 seconds for catalog-operator pod to restart and re-discover CatalogSources..."
+                sleep 30
+                
+                # Wait for new pod to be ready
+                oc wait --for=condition=Ready pod -n olm -l app=catalog-operator --timeout=60s || true
+                
+                # Get new pod name
+                NEW_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+                if [ -n "$NEW_CATALOG_OP_POD" ]; then
+                  echo "New catalog-operator pod: $NEW_CATALOG_OP_POD"
+                  echo "Waiting 10 seconds for it to process CatalogSources..."
+                  sleep 10
+                  
+                  # Check if it has discovered the CatalogSource
+                  if oc logs -n olm $NEW_CATALOG_OP_POD --tail=100 2>/dev/null | grep -qi "toolhive-test-catalog"; then
+                    echo "✓ Catalog-operator has now discovered toolhive-test-catalog after restart"
+                  else
+                    echo "⚠ Catalog-operator still hasn't discovered toolhive-test-catalog after restart"
+                    echo "This may indicate a deeper issue with CatalogSource visibility or catalog-operator configuration"
+                  fi
+                fi
+              else
+                echo "Could not find catalog-operator deployment to restart"
+              fi
+              
               echo "Recent catalog-operator logs (showing what it IS processing):"
               oc logs -n olm $CATALOG_OP_POD --tail=50 2>/dev/null | grep -i "catalog\|source" | tail -5
             fi
