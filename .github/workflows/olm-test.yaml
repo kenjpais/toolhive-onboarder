@@ -612,14 +612,96 @@ jobs:
           
           echo "✓ Catalog verification complete - operator 'toolhive-operator' is available in catalog"
       
-      - name: Apply Subscription (after CatalogSource is READY)
+      - name: Wait for catalog-operator to index catalog
         run: |
           set -e
-          echo "Applying Subscription (CatalogSource is now READY)..."
+          echo "Waiting for catalog-operator to fully index the catalog..."
+          echo "This ensures the catalog-operator's internal cache is updated before creating Subscription."
+          echo ""
+          
+          # Wait additional time for catalog-operator to process the catalog
+          echo "Waiting 30 seconds for catalog-operator to index catalog..."
+          sleep 30
+          
+          # Check catalog-operator logs for indexing activity
+          echo "Checking catalog-operator logs for catalog indexing..."
+          CATALOG_OPERATOR_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -n "$CATALOG_OPERATOR_POD" ]; then
+            echo "Catalog-operator pod: $CATALOG_OPERATOR_POD"
+            echo "Recent catalog-operator logs (last 20 lines):"
+            oc logs -n olm $CATALOG_OPERATOR_POD --tail=20 | grep -i "catalog\|toolhive\|index" || echo "No catalog-related logs found"
+          fi
+          
+          # Verify catalog is accessible via catalog-operator
+          echo ""
+          echo "Verifying catalog is accessible..."
+          CATALOG_SVC="toolhive-test-catalog.openshift-marketplace.svc:50051"
+          echo "Catalog service: $CATALOG_SVC"
+          
+          # Check if catalog pod is still running and ready
+          CATALOG_POD=$(oc get pods -n openshift-marketplace -l olm.catalogSource=toolhive-test-catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -n "$CATALOG_POD" ]; then
+            echo "Catalog pod: $CATALOG_POD"
+            oc get pod $CATALOG_POD -n openshift-marketplace -o jsonpath='{.status.phase}' && echo " (status)"
+          fi
+          
+          # Additional verification: Check if catalog-operator has processed the catalog
+          echo ""
+          echo "Verifying catalog-operator has processed the catalog..."
+          MAX_RETRIES=10
+          RETRY=0
+          CATALOG_PROCESSED=false
+          
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            RETRY=$((RETRY + 1))
+            echo "Attempt $RETRY/$MAX_RETRIES: Checking if catalog-operator recognizes the catalog..."
+            
+            # Check catalog-operator logs for successful catalog processing
+            if [ -n "$CATALOG_OPERATOR_POD" ]; then
+              if oc logs -n olm $CATALOG_OPERATOR_POD --tail=50 2>/dev/null | grep -qi "toolhive-test-catalog.*ready\|toolhive-test-catalog.*success\|catalog.*indexed"; then
+                echo "✓ Found evidence of catalog processing in catalog-operator logs"
+                CATALOG_PROCESSED=true
+                break
+              fi
+            fi
+            
+            # Also check if CatalogSource status shows it's been processed
+            CATALOG_STATUS=$(oc get catalogsource toolhive-test-catalog -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "")
+            if [ "$CATALOG_STATUS" = "READY" ]; then
+              echo "✓ CatalogSource is READY"
+              # Give it a bit more time
+              if [ $RETRY -ge 5 ]; then
+                echo "CatalogSource has been READY for sufficient time, proceeding..."
+                CATALOG_PROCESSED=true
+                break
+              fi
+            fi
+            
+            if [ $RETRY -lt $MAX_RETRIES ]; then
+              echo "Waiting 5 seconds before retry..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$CATALOG_PROCESSED" = "false" ]; then
+            echo "WARNING: Could not verify catalog-operator has fully processed the catalog"
+            echo "Proceeding anyway - the subscription will be created and we'll see if it resolves"
+          else
+            echo "✓ Catalog appears to be processed by catalog-operator"
+          fi
+          
+          echo ""
+          echo "✓ Catalog indexing wait complete"
+          echo "CatalogSource should now be fully indexed by catalog-operator"
+      
+      - name: Apply Subscription (after CatalogSource is READY and indexed)
+        run: |
+          set -e
+          echo "Applying Subscription (CatalogSource is READY and indexed)..."
           
           # Delete existing Subscription if it exists (to recreate it fresh)
           oc delete subscription toolhive-operator -n ${{ env.OPERATOR_NS }} --ignore-not-found=true || true
-          sleep 2
+          sleep 3
           
           # Apply Subscription from split files
           SUBSCRIPTION_APPLIED=false
