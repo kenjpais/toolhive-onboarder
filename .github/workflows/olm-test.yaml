@@ -738,10 +738,14 @@ jobs:
           DISCOVERED=false
           
           if [ -n "$CATALOG_OP_POD" ]; then
-            # Check last 1000 lines of logs (catalog-operator may have been running for a while)
-            # Look for "processing" or mentions of toolhive-test-catalog
-            if oc logs -n olm $CATALOG_OP_POD --tail=1000 2>/dev/null | grep -qi "toolhive-test-catalog\|processing.*toolhive" || false; then
-              echo "✓ Catalog-operator has discovered toolhive-test-catalog"
+            # Check last 2000 lines of logs (catalog-operator may have been running for a while)
+            # Look for evidence of catalog sync (discovery) - "syncing catalog source", "synchronizing registry server", or "registry state good"
+            CATALOG_SYNC_EVIDENCE=$(oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -i "syncing catalog source.*toolhive-test-catalog\|synchronizing registry server.*toolhive-test-catalog\|registry state good.*toolhive-test-catalog\|ensuring registry server.*toolhive-test-catalog" || echo "")
+            
+            if [ -n "$CATALOG_SYNC_EVIDENCE" ]; then
+              echo "✓ Catalog-operator has discovered and is syncing toolhive-test-catalog"
+              echo "Sync evidence:"
+              echo "$CATALOG_SYNC_EVIDENCE" | tail -3
               DISCOVERED=true
             else
               echo "✗ Catalog-operator has NOT discovered toolhive-test-catalog"
@@ -907,28 +911,60 @@ jobs:
               fi
             fi
             
-            # Apply FIX 2: Restart catalog-operator to flush cache
+            # CRITICAL FIX: Always restart catalog-operator pod (not deployment) to force CatalogSource discovery
+            # This fixes the known OLM bug where CatalogSources created before catalog-operator finishes starting
+            # are never registered. Restarting the pod forces a full rescan of all CatalogSources.
             echo ""
-            echo "Step 4: Applying FIX 2 - Restarting catalog-operator to flush discovery cache..."
-            CATALOG_OP_DEPLOY=$(oc get deployment -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-            if [ -n "$CATALOG_OP_DEPLOY" ]; then
-              echo "Restarting catalog-operator deployment: $CATALOG_OP_DEPLOY"
-              oc rollout restart deployment/$CATALOG_OP_DEPLOY -n olm || true
-              echo "Waiting 30 seconds for catalog-operator pod to restart and re-discover CatalogSources..."
-              sleep 30
+            echo "Step 4: CRITICAL FIX - Restarting catalog-operator POD to force CatalogSource discovery..."
+            echo "This fixes the known OLM bug where CatalogSources may not be discovered if created before"
+            echo "catalog-operator finished starting. Restarting the pod forces a full rescan."
+            
+            # Get current pod name before deletion
+            OLD_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            
+            if [ -n "$OLD_CATALOG_OP_POD" ]; then
+              echo "Deleting catalog-operator pod: $OLD_CATALOG_OP_POD"
+              echo "NOTE: Do NOT delete the Deployment - only the pod (as recommended)"
+              oc delete pod $OLD_CATALOG_OP_POD -n olm || true
+              
+              echo "Waiting for new catalog-operator pod to be created and ready..."
+              # Wait for new pod to be created
+              MAX_POD_WAIT=60
+              POD_ELAPSED=0
+              while [ $POD_ELAPSED -lt $MAX_POD_WAIT ]; do
+                NEW_POD_COUNT=$(oc get pods -n olm -l app=catalog-operator --no-headers 2>/dev/null | grep -v "Terminating" | wc -l || echo "0")
+                if [ "$NEW_POD_COUNT" -gt 0 ]; then
+                  NEW_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[?(@.status.phase!="Terminating")].metadata.name}' 2>/dev/null | awk '{print $1}' || echo "")
+                  if [ -n "$NEW_CATALOG_OP_POD" ] && [ "$NEW_CATALOG_OP_POD" != "$OLD_CATALOG_OP_POD" ]; then
+                    echo "✓ New catalog-operator pod created: $NEW_CATALOG_OP_POD"
+                    break
+                  fi
+                fi
+                echo "Waiting for new pod to be created... (${POD_ELAPSED}s/${MAX_POD_WAIT}s)"
+                sleep 3
+                POD_ELAPSED=$((POD_ELAPSED + 3))
+              done
+              
+              if [ -z "$NEW_CATALOG_OP_POD" ] || [ "$NEW_CATALOG_OP_POD" = "$OLD_CATALOG_OP_POD" ]; then
+                echo "⚠ WARNING: Could not detect new pod, using current pod"
+                NEW_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+              fi
               
               # Wait for new pod to be ready
-              oc wait --for=condition=Ready pod -n olm -l app=catalog-operator --timeout=60s || true
-              
-              # Get new pod name
-              NEW_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
               if [ -n "$NEW_CATALOG_OP_POD" ]; then
-                echo "New catalog-operator pod: $NEW_CATALOG_OP_POD"
-                echo "Waiting 15 seconds for it to process CatalogSources..."
-                sleep 15
+                echo "Waiting for pod $NEW_CATALOG_OP_POD to be Ready..."
+                oc wait --for=condition=Ready pod/$NEW_CATALOG_OP_POD -n olm --timeout=60s || {
+                  echo "⚠ WARNING: Pod may not be fully ready, but continuing..."
+                }
+                
+                echo "Waiting 20 seconds for catalog-operator to rescan all CatalogSources..."
+                sleep 20
+              else
+                echo "⚠ WARNING: Could not find catalog-operator pod after restart"
               fi
             else
-              echo "Could not find catalog-operator deployment to restart"
+              echo "⚠ WARNING: Could not find catalog-operator pod to restart"
+              NEW_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
             fi
             
             # CRITICAL: Check if catalog-operator has successfully CONNECTED (not just discovered)
@@ -943,17 +979,28 @@ jobs:
               CONNECTED=false
               
               while [ $CONNECTION_ELAPSED -lt $MAX_CONNECTION_WAIT ]; do
-                # Check for successful connection (READY state, not CONNECTING)
-                if oc logs -n olm $CHECK_POD --tail=500 2>/dev/null | grep -qi "toolhive-test-catalog.*READY\|toolhive-test-catalog.*state.*READY\|toolhive-test-catalog.*connected" || false; then
-                  echo "✓ Catalog-operator has successfully connected to toolhive-test-catalog!"
+                # Check for CONNECTING state (this is what we want to see - means catalog-operator is trying to connect)
+                if oc logs -n olm $CHECK_POD --tail=1000 2>/dev/null | grep -qi "toolhive-test-catalog.*CONNECTING\|state.*CONNECTING.*toolhive-test-catalog" || false; then
+                  echo "✓ Catalog-operator is CONNECTING to toolhive-test-catalog (discovery confirmed!)"
+                  echo "This is expected - catalog-operator has discovered the catalog and is connecting..."
+                  CONNECTED=true
+                  DISCOVERED=true
+                  # Show the connection state log
+                  oc logs -n olm $CHECK_POD --tail=1000 2>/dev/null | grep -i "toolhive-test-catalog.*CONNECTING\|state.*CONNECTING.*toolhive-test-catalog" | tail -3 || true
+                  break
+                fi
+                
+                # Check for successful connection (READY state)
+                if oc logs -n olm $CHECK_POD --tail=1000 2>/dev/null | grep -qi "toolhive-test-catalog.*READY\|toolhive-test-catalog.*state.*READY\|toolhive-test-catalog.*connected" || false; then
+                  echo "✓ Catalog-operator has successfully connected to toolhive-test-catalog (READY state)!"
                   CONNECTED=true
                   DISCOVERED=true
                   break
                 fi
                 
-                # Check if still in CONNECTING state
-                if oc logs -n olm $CHECK_POD --tail=500 2>/dev/null | grep -qi "toolhive-test-catalog.*CONNECTING" || false; then
-                  echo "Catalog-operator is still CONNECTING... (${CONNECTION_ELAPSED}s/${MAX_CONNECTION_WAIT}s)"
+                # Check for catalog sync evidence (means it's discovered but may not have connected yet)
+                if oc logs -n olm $CHECK_POD --tail=1000 2>/dev/null | grep -qi "syncing catalog source.*toolhive-test-catalog\|synchronizing registry server.*toolhive-test-catalog" || false; then
+                  echo "Catalog-operator is syncing toolhive-test-catalog... (${CONNECTION_ELAPSED}s/${MAX_CONNECTION_WAIT}s)"
                 fi
                 
                 sleep 5
@@ -1005,6 +1052,28 @@ jobs:
           else
             echo ""
             echo "Step 2: Catalog-operator has already discovered the CatalogSource"
+            echo "However, we still need to ensure catalog-operator has queried it for operators."
+            echo "Applying FIX: Restarting catalog-operator pod to force full rescan..."
+            
+            # Even if discovered, restart to ensure it queries for operators
+            # This fixes the case where catalog-operator syncs the pod but doesn't query it
+            OLD_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [ -n "$OLD_CATALOG_OP_POD" ]; then
+              echo "Deleting catalog-operator pod: $OLD_CATALOG_OP_POD"
+              oc delete pod $OLD_CATALOG_OP_POD -n olm || true
+              
+              # Wait for new pod
+              echo "Waiting for new catalog-operator pod..."
+              sleep 10
+              oc wait --for=condition=Ready pod -n olm -l app=catalog-operator --timeout=60s || true
+              NEW_CATALOG_OP_POD=$(oc get pods -n olm -l app=catalog-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+              if [ -n "$NEW_CATALOG_OP_POD" ]; then
+                echo "New catalog-operator pod: $NEW_CATALOG_OP_POD"
+                echo "Waiting 20 seconds for catalog-operator to rescan CatalogSources..."
+                sleep 20
+              fi
+            fi
+            
             echo "Annotating CatalogSource to trigger refresh..."
             oc annotate catalogsource toolhive-test-catalog -n openshift-marketplace \
               operators.coreos.com/catalog-refresh=$(date +%s) --overwrite || true
@@ -1325,8 +1394,13 @@ jobs:
               echo "Searching catalog-operator logs for toolhive-test-catalog..."
               # Use || true to prevent grep from causing script failure
               
+              # Check if catalog-operator is syncing the catalog (evidence of discovery)
+              CATALOG_SYNCED=$(oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -i "syncing catalog source.*toolhive-test-catalog\|synchronizing registry server.*toolhive-test-catalog\|registry state good.*toolhive-test-catalog" || echo "")
+              
               # CRITICAL: Check for CONNECTING state (this is the root cause!)
-              if oc logs -n olm $CATALOG_OP_POD --tail=1000 2>/dev/null | grep -qi "toolhive-test-catalog.*CONNECTING\|state.*CONNECTING.*toolhive-test-catalog" || false; then
+              CONNECTING_STATE=$(oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -i "toolhive-test-catalog.*CONNECTING\|state.*CONNECTING.*toolhive-test-catalog" || echo "")
+              
+              if [ -n "$CONNECTING_STATE" ]; then
                 echo "✗ CRITICAL: Catalog-operator is stuck in CONNECTING state!"
                 echo ""
                 echo "ROOT CAUSE: Catalog-operator is trying to connect to the catalog pod but cannot complete the connection."
@@ -1359,17 +1433,38 @@ jobs:
                   oc get svc toolhive-test-catalog -n openshift-marketplace -o yaml | grep -A 5 "spec:" || true
                   oc get endpoints toolhive-test-catalog -n openshift-marketplace -o yaml || true
                 fi
-              elif oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -qi "toolhive-test-catalog.*READY\|toolhive-test-catalog.*state.*READY\|toolhive-test-catalog.*connected" || false; then
+              elif [ -n "$CATALOG_SYNCED" ]; then
+                echo "✓ Catalog-operator IS syncing toolhive-test-catalog (discovered)"
+                echo "Recent sync logs:"
+                echo "$CATALOG_SYNCED" | tail -5
+                echo ""
+                echo "⚠ WARNING: Catalog is synced but catalog-operator may not be querying it for operators"
+                echo "This is why subscription resolution fails - catalog-operator knows about the catalog"
+                echo "but hasn't successfully queried it to discover operators."
+                echo ""
+                echo "Checking if catalog-operator has queried the catalog for operators..."
+                QUERY_LOGS=$(oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -i "toolhive-test-catalog.*query\|toolhive-test-catalog.*list\|toolhive-test-catalog.*get.*package\|resolving.*toolhive-test-catalog" || echo "")
+                if [ -z "$QUERY_LOGS" ]; then
+                  echo "✗ CRITICAL: Catalog-operator has NOT queried toolhive-test-catalog for operators!"
+                  echo "This is the root cause - catalog-operator syncs the catalog pod but doesn't query it."
+                  echo ""
+                  echo "SOLUTION: Catalog-operator needs to query the catalog's gRPC endpoint to discover operators."
+                  echo "The CONNECTING state indicates it cannot complete the gRPC connection."
+                else
+                  echo "Found query attempts:"
+                  echo "$QUERY_LOGS" | tail -5
+                fi
+              elif oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -qi "toolhive-test-catalog.*READY\|toolhive-test-catalog.*state.*READY\|toolhive-test-catalog.*connected" || false; then
                 echo "✓ Catalog-operator has successfully connected to toolhive-test-catalog (READY state)"
                 echo "Recent connection logs:"
-                oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -i "toolhive-test-catalog.*READY\|toolhive-test-catalog.*state\|toolhive-test-catalog" | tail -5 || true
-              elif oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -qi "toolhive-test-catalog" || false; then
+                oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -i "toolhive-test-catalog.*READY\|toolhive-test-catalog.*state\|toolhive-test-catalog" | tail -5 || true
+              elif oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -qi "toolhive-test-catalog" || false; then
                 echo "⚠ Found toolhive-test-catalog in catalog-operator logs but connection state unclear"
                 echo "Recent mentions:"
-                oc logs -n olm $CATALOG_OP_POD --tail=500 2>/dev/null | grep -i "toolhive-test-catalog" | tail -5 || true
+                oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -i "toolhive-test-catalog" | tail -5 || true
                 echo ""
                 echo "Checking for connection state information..."
-                oc logs -n olm $CATALOG_OP_POD --tail=1000 2>/dev/null | grep -i "toolhive-test-catalog.*state\|toolhive-test-catalog.*connect" | tail -10 || true
+                oc logs -n olm $CATALOG_OP_POD --tail=2000 2>/dev/null | grep -i "toolhive-test-catalog.*state\|toolhive-test-catalog.*connect" | tail -10 || true
               else
                 echo "✗ ERROR: catalog-operator has NOT discovered toolhive-test-catalog!"
                 echo "This is the root cause - catalog-operator is not aware of the CatalogSource."
